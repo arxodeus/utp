@@ -1,0 +1,417 @@
+//go:build cgo
+
+package libutp_test
+
+import (
+	"container/heap"
+	"math/rand"
+	"net"
+	"runtime"
+	"sync"
+	"testing"
+	"time"
+)
+
+// A userspace impairment relay between two real UDP sockets.
+//
+// The adverse-conditions tests in netem damage packets inside an emulated
+// network, where libutp is driven by a Go loop on a clock the loop sets. Here
+// both implementations run as they would in production -- libutp on its own
+// kernel socket, its own thread and the real clock, this library on a real
+// utpnet socket -- and only the path between them is artificial.
+//
+// It is artificial in userspace because it has to be: this host's kernel is
+// built without netem (CONFIG_NET_SCH_NETEM is not set) and has no tc, so
+// loopback cannot be told to lose or reorder anything. Every datagram still
+// leaves one kernel socket and arrives at another; the relay only decides
+// which of them arrive, and when.
+//
+// Topology: libutp <-> relay.sideA ... relay.sideB <-> ours. Whatever arrives
+// on sideA is forwarded from sideB to our socket, and whatever arrives on
+// sideB is forwarded from sideA to libutp's, so each implementation sees the
+// relay as its peer.
+
+// pathConfig is one direction's impairment.
+type pathConfig struct {
+	Delay        time.Duration // one-way propagation
+	Jitter       time.Duration // uniform in [-Jitter, +Jitter] around Delay, as in netem
+	BandwidthBps int64         // bottleneck rate; zero means unlimited
+	QueueBytes   int           // bottleneck queue; a datagram that does not fit is dropped
+	LossRate     float64       // independent random loss
+	ReorderRate  float64       // fraction held back by ReorderHold, so later ones overtake
+	ReorderHold  time.Duration
+}
+
+// pathStats counts what one direction did.
+type pathStats struct {
+	Offered, Delivered, DroppedByLoss, DroppedByQueue, Reordered uint64
+}
+
+type relayItem struct {
+	at      time.Time
+	seq     uint64
+	payload []byte
+}
+
+type relayHeap []relayItem
+
+func (h relayHeap) Len() int { return len(h) }
+func (h relayHeap) Less(i, j int) bool {
+	if !h[i].at.Equal(h[j].at) {
+		return h[i].at.Before(h[j].at)
+	}
+	return h[i].seq < h[j].seq
+}
+func (h relayHeap) Swap(i, j int) { h[i], h[j] = h[j], h[i] }
+func (h *relayHeap) Push(x any)   { *h = append(*h, x.(relayItem)) }
+func (h *relayHeap) Pop() any {
+	old := *h
+	it := old[len(old)-1]
+	*h = old[:len(old)-1]
+	return it
+}
+
+// relayPath is one direction: datagrams read from in are written from out to
+// dst after the impairment decides their fate.
+type relayPath struct {
+	cfg pathConfig
+	out *net.UDPConn
+	dst *net.UDPAddr
+
+	mu       sync.Mutex
+	rng      *rand.Rand
+	pending  relayHeap
+	seq      uint64
+	nextFree time.Time // when the bottleneck finishes serializing its queue
+	queued   int       // bytes waiting in the bottleneck queue
+	stats    pathStats
+	wake     chan struct{}
+
+	// trace, when non-nil, records every datagram offered and whether it
+	// was dropped, for diagnosing a transfer after the fact.
+	trace *[]relayEvent
+	// delivered, when non-nil, records every datagram as it is written to
+	// its destination.
+	delivered *[]relayEvent
+
+	// child and name, for a relay in its own process: whom to ask for this
+	// path's counts, and which path this is.
+	child *relayChild
+	name  string
+}
+
+// parseRelayEvent reads the uTP header fields, and the selective ack if there
+// is one, out of a datagram.
+func parseRelayEvent(b []byte, at time.Time) relayEvent {
+	ev := relayEvent{At: at, Type: b[0] >> 4,
+		Seq: uint16(b[16])<<8 | uint16(b[17]), Ack: uint16(b[18])<<8 | uint16(b[19]), Len: len(b),
+		Wnd: uint32(b[12])<<24 | uint32(b[13])<<16 | uint32(b[14])<<8 | uint32(b[15])}
+	// Walk the extension chain for a selective ack (type 1).
+	for next, off := b[1], 20; next != 0 && off+2 <= len(b); {
+		typ, n := next, int(b[off+1])
+		next = b[off]
+		if off+2+n > len(b) {
+			break
+		}
+		if typ == 1 {
+			ev.Sack = append([]byte(nil), b[off+2:off+2+n]...)
+		}
+		off += 2 + n
+	}
+	return ev
+}
+
+// relayEvent is one offered datagram, as the relay saw it.
+type relayEvent struct {
+	At   time.Time
+	Type byte // uTP packet type, the high nibble of the first byte
+	Seq  uint16
+	Ack  uint16
+	Wnd  uint32 // advertised receive window
+	Len  int
+	// Sack is the selective-ack bitmask, if the packet carries one: bit i of
+	// the whole mask, least significant first, is ack_nr + 2 + i (BEP 29).
+	Sack    []byte
+	Dropped bool
+}
+
+func (p *relayPath) offer(b []byte, now time.Time) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	p.stats.Offered++
+	var ev *relayEvent
+	if p.trace != nil && len(b) >= 20 {
+		*p.trace = append(*p.trace, parseRelayEvent(b, now))
+		ev = &(*p.trace)[len(*p.trace)-1]
+	}
+	if p.cfg.LossRate > 0 && p.rng.Float64() < p.cfg.LossRate {
+		p.stats.DroppedByLoss++
+		if ev != nil {
+			ev.Dropped = true
+		}
+		return
+	}
+	depart := now
+	if p.cfg.BandwidthBps > 0 {
+		// Bytes still waiting to be serialized are the queue.
+		if p.nextFree.After(now) {
+			p.queued = int(float64(p.nextFree.Sub(now)) / float64(time.Second) * float64(p.cfg.BandwidthBps) / 8)
+		} else {
+			p.queued, p.nextFree = 0, now
+		}
+		if p.cfg.QueueBytes > 0 && p.queued+len(b) > p.cfg.QueueBytes {
+			p.stats.DroppedByQueue++
+			if ev != nil {
+				ev.Dropped = true
+			}
+			return
+		}
+		p.nextFree = p.nextFree.Add(time.Duration(float64(len(b)*8) / float64(p.cfg.BandwidthBps) * float64(time.Second)))
+		depart = p.nextFree
+	}
+	delay := p.cfg.Delay
+	if p.cfg.Jitter > 0 {
+		delay += time.Duration(p.rng.Int63n(int64(2*p.cfg.Jitter)+1)) - p.cfg.Jitter
+		if delay < 0 {
+			delay = 0
+		}
+	}
+	at := depart.Add(delay)
+	if p.cfg.ReorderRate > 0 && p.rng.Float64() < p.cfg.ReorderRate {
+		at = at.Add(p.cfg.ReorderHold)
+		p.stats.Reordered++
+	}
+	p.seq++
+	heap.Push(&p.pending, relayItem{at: at, seq: p.seq, payload: append([]byte(nil), b...)})
+	select {
+	case p.wake <- struct{}{}:
+	default:
+	}
+}
+
+// relaySpin is how long before a datagram is due deliver stops sleeping and
+// spins, so that it is written within microseconds of its time.
+const relaySpin = 1500 * time.Microsecond
+
+// deliver writes out each datagram when it is due, until done closes.
+func (p *relayPath) deliver(done <-chan struct{}) {
+	timer := time.NewTimer(time.Hour)
+	defer timer.Stop()
+	for {
+		p.mu.Lock()
+		now := time.Now()
+		var due [][]byte
+		for p.pending.Len() > 0 && !p.pending[0].at.After(now) {
+			due = append(due, heap.Pop(&p.pending).(relayItem).payload)
+		}
+		wait := time.Hour
+		if p.pending.Len() > 0 {
+			wait = p.pending[0].at.Sub(now)
+		}
+		p.stats.Delivered += uint64(len(due))
+		p.mu.Unlock()
+
+		for _, b := range due {
+			// Stamped before the write, not after: on loopback the datagram
+			// is in the receiver's socket before WriteToUDP returns, and a
+			// receiver quick enough could acknowledge it before an
+			// after-the-write stamp. turnaround then skipped that
+			// acknowledgement as earlier than the delivery and paired the
+			// packet with the next one, a packet interval later.
+			at := time.Now()
+			_, _ = p.out.WriteToUDP(b, p.dst)
+			if p.delivered != nil && len(b) >= 20 {
+				p.mu.Lock()
+				*p.delivered = append(*p.delivered, parseRelayEvent(b, at))
+				p.mu.Unlock()
+			}
+		}
+		// A Go timer under a millisecond fires after about 1.1 ms when the
+		// runtime is otherwise idle (epoll waits in whole milliseconds), which
+		// would deliver a 20 Mb/s path's packets in pairs and a 100 Mb/s
+		// path's in clumps of ten. Packets on a link arrive spaced, so the
+		// last stretch before a datagram is due is spun instead.
+		if wait < relaySpin {
+			select {
+			case <-p.wake:
+			case <-done:
+				return
+			default:
+				runtime.Gosched()
+			}
+			continue
+		}
+		timer.Reset(wait - relaySpin)
+		select {
+		case <-timer.C:
+		case <-p.wake:
+			if !timer.Stop() {
+				select {
+				case <-timer.C:
+				default:
+				}
+			}
+		case <-done:
+			return
+		}
+	}
+}
+
+func (p *relayPath) Stats() pathStats {
+	if p.child != nil {
+		return p.child.stats(p.name)
+	}
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	return p.stats
+}
+
+// relay joins libutp's socket to ours through two impaired paths.
+type relay struct {
+	sideA, sideB *net.UDPConn // sideA faces libutp, sideB faces us
+	toGo, toLib  *relayPath
+	done         chan struct{}
+	wg           sync.WaitGroup
+	closeOnce    sync.Once
+	// child, when not nil, is the process this relay runs in: see
+	// relayInOwnProcess. sideA, sideB and the paths' sockets are then the
+	// child's, and the paths here only receive what it recorded.
+	child *relayChild
+}
+
+// newRelay starts a relay between libutp at libPort and our socket at goPort.
+// toGo impairs what libutp sends; toLib what we send.
+func newRelay(t *testing.T, libPort, goPort uint16, toGo, toLib pathConfig, seed int64) *relay {
+	t.Helper()
+	var r *relay
+	var err error
+	if relayInOwnProcess {
+		r, err = startRelayProcess(libPort, goPort, toGo, toLib, seed)
+	} else {
+		r, err = startRelay(libPort, goPort, toGo, toLib, seed, onNewRelay)
+	}
+	if err != nil {
+		t.Fatal(err)
+	}
+	return r
+}
+
+// startRelay is newRelay in this process. hook, if not nil, sees the relay
+// before it starts forwarding.
+func startRelay(libPort, goPort uint16, toGo, toLib pathConfig, seed int64, hook func(*relay)) (*relay, error) {
+	listen := func() (*net.UDPConn, error) {
+		c, err := net.ListenUDP("udp4", &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1)})
+		if err != nil {
+			return nil, err
+		}
+		_ = c.SetReadBuffer(4 << 20)
+		_ = c.SetWriteBuffer(4 << 20)
+		return c, nil
+	}
+	sideA, err := listen()
+	if err != nil {
+		return nil, err
+	}
+	sideB, err := listen()
+	if err != nil {
+		_ = sideA.Close()
+		return nil, err
+	}
+	r := &relay{sideA: sideA, sideB: sideB, done: make(chan struct{})}
+	r.toGo = &relayPath{cfg: toGo, out: r.sideB, dst: loopback(goPort),
+		rng: rand.New(rand.NewSource(seed)), wake: make(chan struct{}, 1)}
+	r.toLib = &relayPath{cfg: toLib, out: r.sideA, dst: loopback(libPort),
+		rng: rand.New(rand.NewSource(seed + 1)), wake: make(chan struct{}, 1)}
+
+	if hook != nil {
+		hook(r)
+	}
+	// A datagram is taken as arriving when the kernel received it, not when
+	// this goroutine woke to read it. On loopback that is the instant the
+	// sender's sendto put it there -- when an acknowledgement left the
+	// receiver, which is what TestAckTurnaround means to time. This
+	// goroutine's own wake-up was in it before, and it is not the same for
+	// both receivers: it shares the Go runtime with this library's receiver,
+	// still busy finishing the pass that sent the acknowledgement, and not
+	// with libutp's thread. Measured at the receivers themselves, kernel
+	// arrival to the acknowledgement's sendto, the gap between the two was
+	// 12-15us at the median where this relay reported 30.
+	pump := func(in *net.UDPConn, p *relayPath) {
+		defer r.wg.Done()
+		enableRxTimestamps(in)
+		buf := make([]byte, 65536)
+		oob := make([]byte, 128)
+		for {
+			n, oobn, _, _, err := in.ReadMsgUDP(buf, oob)
+			if err != nil {
+				return
+			}
+			at, ok := rxTimestamp(oob[:oobn])
+			if !ok {
+				at = time.Now()
+			}
+			p.offer(buf[:n], at)
+		}
+	}
+	r.wg.Add(4)
+	go pump(r.sideA, r.toGo)
+	go pump(r.sideB, r.toLib)
+	go func() { defer r.wg.Done(); r.toGo.deliver(r.done) }()
+	go func() { defer r.wg.Done(); r.toLib.deliver(r.done) }()
+	return r, nil
+}
+
+// onNewRelay, when set, sees every relay before it starts forwarding: a
+// diagnostic can switch tracing on (relayPath.trace) and keep the relay.
+var onNewRelay func(*relay)
+
+// LibutpFacingPort is where libutp should send: the relay's side facing it.
+func (r *relay) LibutpFacingPort() uint16 {
+	if r.child != nil {
+		return r.child.portA
+	}
+	return uint16(r.sideA.LocalAddr().(*net.UDPAddr).Port)
+}
+
+// GoFacingAddr is where our socket should send.
+func (r *relay) GoFacingAddr() *net.UDPAddr {
+	if r.child != nil {
+		return loopback(r.child.portB)
+	}
+	return r.sideB.LocalAddr().(*net.UDPAddr)
+}
+
+// Close stops the relay once everything in flight has been read, and returns
+// when its goroutines have: what they recorded (relayPath.delivered, trace)
+// may be read after it. Closing again does nothing.
+func (r *relay) Close() {
+	if r.child != nil {
+		r.closeOnce.Do(r.child.close)
+		return
+	}
+	r.closeOnce.Do(r.close)
+}
+
+func (r *relay) close() {
+	// Let what is already on its way in be read first. A test ends the
+	// moment its receiver sees the end of the stream, and closing the
+	// sockets then discards whatever they hold unread: an acknowledgement
+	// the receiver sent microseconds before was lost from the trace, and
+	// TestAckTurnaround counted its packets as never acknowledged -- in
+	// go->go about one run in fifteen, every time the last data packet and
+	// the FIN, read together, whose acknowledgement was the last thing sent.
+	// Closing waits for 20 ms with nothing offered, a second at most.
+	offered := func() uint64 { return r.toGo.Stats().Offered + r.toLib.Stats().Offered }
+	for deadline, last := time.Now().Add(time.Second), offered(); time.Now().Before(deadline); {
+		time.Sleep(20 * time.Millisecond)
+		now := offered()
+		if now == last {
+			break
+		}
+		last = now
+	}
+	close(r.done)
+	_ = r.sideA.Close()
+	_ = r.sideB.Close()
+	r.wg.Wait()
+}

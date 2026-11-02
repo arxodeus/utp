@@ -1,0 +1,514 @@
+package utp
+
+import (
+	"testing"
+	"time"
+
+	"github.com/stretchr/testify/require"
+)
+
+func TestOnTransmit(t *testing.T) {
+	ctrl := newDefaultController(defaultCtrlConfig())
+	initialTimeout := ctrl.Timeout()
+
+	// Register the initial transmission of sequence number 1.
+	seqNum := uint16(1)
+	packetOneSizeBytes := uint32(32)
+
+	err := ctrl.OnTransmit(seqNum, transmitInitial, packetOneSizeBytes)
+	require.NoError(t, err, "transmission registration failed")
+
+	transmissionRecord, exists := ctrl.transmissions[seqNum]
+	require.True(t, exists, "transmission not recorded")
+	require.Equal(t, packetOneSizeBytes, transmissionRecord.SizeBytes,
+		"expected size %d, got %d", packetOneSizeBytes, transmissionRecord.SizeBytes)
+	require.Equal(t, uint32(1), transmissionRecord.NumTransmissions,
+		"expected 1 transmission, got %d", transmissionRecord.NumTransmissions)
+
+	require.Equal(t, packetOneSizeBytes, ctrl.windowSizeBytes,
+		"expected window size %d, got %d", packetOneSizeBytes, ctrl.windowSizeBytes)
+
+	// Register the initial transmission of sequence number 2.
+	seqNum = 2
+	packetTwoSizeBytes := uint32(128)
+
+	err = ctrl.OnTransmit(seqNum, transmitInitial, packetTwoSizeBytes)
+	require.NoError(t, err, "transmission registration failed")
+
+	transmissionRecord, exists = ctrl.transmissions[seqNum]
+	require.True(t, exists, "transmission not recorded")
+	require.Equal(t, packetTwoSizeBytes, transmissionRecord.SizeBytes,
+		"expected size %d, got %d", packetOneSizeBytes, transmissionRecord.SizeBytes)
+	require.Equal(t, uint32(1), transmissionRecord.NumTransmissions,
+		"expected 1 transmission, got %d", transmissionRecord.NumTransmissions)
+
+	require.Equal(t, packetOneSizeBytes+packetTwoSizeBytes, ctrl.windowSizeBytes,
+		"expected window size %d, got %d", packetOneSizeBytes+packetTwoSizeBytes, ctrl.windowSizeBytes)
+
+	// Register the retransmission of sequence number 2.
+	err = ctrl.OnTransmit(seqNum, transmitRetransmission, 0)
+	require.NoError(t, err, "transmission registration failed")
+
+	transmissionRecord, exists = ctrl.transmissions[seqNum]
+	require.True(t, exists, "transmission not recorded")
+	require.Equal(t, packetTwoSizeBytes, transmissionRecord.SizeBytes,
+		"expected size %d, got %d", packetOneSizeBytes, transmissionRecord.SizeBytes)
+	require.Equal(t, uint32(2), transmissionRecord.NumTransmissions,
+		"expected 1 transmission, got %d", transmissionRecord.NumTransmissions)
+
+	require.Equal(t, packetOneSizeBytes+packetTwoSizeBytes, ctrl.windowSizeBytes,
+		"expected window size %d, got %d", packetOneSizeBytes+packetTwoSizeBytes, ctrl.windowSizeBytes)
+
+	if ctrl.Timeout() != initialTimeout {
+		t.Fatalf("expected timeout %v, got %v", initialTimeout, ctrl.Timeout())
+	}
+}
+
+func TestOnTransmitDuplicateTransmission(t *testing.T) {
+	ctrl := newDefaultController(defaultCtrlConfig())
+
+	// Register the initial transmission of sequence number 1.
+	seqNum := uint16(1)
+	bytes := uint32(32)
+
+	err := ctrl.OnTransmit(seqNum, transmitInitial, bytes)
+	require.NoError(t, err, "transmission registration failed")
+	require.Equal(t, bytes, ctrl.windowSizeBytes,
+		"expected window size %d, got %d", bytes, ctrl.windowSizeBytes)
+
+	// Register the initial transmission of the same packet.
+	err = ctrl.OnTransmit(seqNum, transmitInitial, bytes)
+	require.ErrorIs(t, err, errDuplicateTransmission, "expected errDuplicateTransmission, got %v", err)
+	require.Equal(t, bytes, ctrl.windowSizeBytes,
+		"expected window size %d, got %d", bytes, ctrl.windowSizeBytes)
+}
+
+func TestOnTransmitUnknownSeqNum(t *testing.T) {
+	ctrl := newDefaultController(defaultCtrlConfig())
+
+	// Register the retransmission of sequence number 1.
+	seqNum := uint16(1)
+	err := ctrl.OnTransmit(seqNum, transmitRetransmission, 0)
+	require.ErrorIs(t, err, errUnknownSeqNum, "expected errUnknownSeqNum, got %v", err)
+	require.Equal(t, uint32(0), ctrl.windowSizeBytes, "expected window size 0, got %d", ctrl.windowSizeBytes)
+}
+
+func TestOnTransmitInsufficientWindowSize(t *testing.T) {
+	ctrl := newDefaultController(defaultCtrlConfig())
+
+	// Register the transmission of sequence number 1.
+	seqNum := uint16(1)
+	bytes := ctrl.maxWindowSizeBytes + 1
+
+	err := ctrl.OnTransmit(seqNum, transmitInitial, bytes)
+	require.ErrorIs(t, err, errInsufficientWindowSize,
+		"expected errInsufficientWindowSize, got %v", err)
+
+	require.Equal(t, uint32(0), ctrl.windowSizeBytes,
+		"expected window size 0, got %d", ctrl.windowSizeBytes)
+}
+
+func TestOnAck(t *testing.T) {
+	ctrl := newDefaultController(defaultCtrlConfig())
+
+	// Register the initial transmission.
+	seqNum := uint16(1)
+	bytes := uint32(32)
+
+	err := ctrl.OnTransmit(seqNum, transmitInitial, bytes)
+	require.NoError(t, err, "transmission registration failed")
+
+	// Register the acknowledgement.
+	ackDelay := 150 * time.Millisecond
+	ackRTT := 300 * time.Millisecond
+	ackReceivedAt := time.Now()
+	ack := ackSample{
+		Delay:      ackDelay,
+		RTT:        ackRTT,
+		ReceivedAt: ackReceivedAt,
+	}
+
+	err = ackOne(ctrl, seqNum, ack)
+	require.NoError(t, err, "ack registration failed")
+
+	// Check the base delay.
+	baseDelay := ctrl.delayAcc.BaseDelay()
+	require.Equal(t, ackDelay, baseDelay, "expected base delay %v, got %v", ackDelay, baseDelay)
+	// Check the window size.
+	require.Equal(t, uint32(0), ctrl.windowSizeBytes, "expected window size 0, got %d", ctrl.windowSizeBytes)
+
+	// Check the timeout.
+	require.True(t, ctrl.minTimeout >= ctrl.Timeout(), "expected timeout %v, got %v", ctrl.minTimeout, ctrl.Timeout())
+}
+
+// ackOne delivers one acknowledgement covering one packet the way
+// sentPackets.onAck does: its delay sample, the packet, then the window
+// update.
+func ackOne(ctrl *defaultController, seq uint16, ack ackSample) error {
+	ctrl.OnAckDelay(ack.Delay, ack.ReceivedAt)
+	defer ctrl.ApplyAck()
+	return ctrl.OnAck(seq, ack)
+}
+
+func TestOnAckUnknownSeqNum(t *testing.T) {
+	ctrl := newDefaultController(defaultCtrlConfig())
+
+	// Register the acknowledgement for sequence number 1.
+	seqNum := uint16(1)
+	ack := ackSample{
+		Delay:      150 * time.Millisecond,
+		RTT:        300 * time.Millisecond,
+		ReceivedAt: time.Now(),
+	}
+
+	err := ctrl.OnAck(seqNum, ack)
+	require.ErrorIs(t, err, errUnknownSeqNum, "expected errUnknownSeqNum, got %v", err)
+}
+
+func TestOnLostPacketRetransmitting(t *testing.T) {
+	ctrl := newDefaultController(defaultCtrlConfig())
+
+	initialMaxWindowSizeBytes := ctrl.minWindowSizeBytes * 10
+	ctrl.maxWindowSizeBytes = initialMaxWindowSizeBytes
+
+	// Register the initial transmission.
+	seqNum := uint16(1)
+	bytes := uint32(32)
+
+	err := ctrl.OnTransmit(seqNum, transmitInitial, bytes)
+	require.NoError(t, err, "transmission registration failed")
+	require.Equal(t, bytes, ctrl.windowSizeBytes,
+		"expected window size %d, got %d", bytes, ctrl.windowSizeBytes)
+
+	// Register the loss, with retransmission.
+	err = ctrl.OnLostPacket(seqNum, true, time.Now())
+	require.NoError(t, err, "lost packet registration failed")
+
+	require.Equal(t, bytes, ctrl.windowSizeBytes,
+		"expected window size %d, got %d", bytes, ctrl.windowSizeBytes)
+
+	require.True(t, ctrl.maxWindowSizeBytes >= ctrl.minWindowSizeBytes,
+		"max window size less than min window size")
+
+	expectedMaxWindow := initialMaxWindowSizeBytes / 2
+	require.Equal(t, expectedMaxWindow, ctrl.maxWindowSizeBytes,
+		"expected max window size %d, got %d", expectedMaxWindow, ctrl.maxWindowSizeBytes)
+}
+
+func TestOnLostPacketUnknownSeqNum(t *testing.T) {
+	ctrl := newDefaultController(defaultCtrlConfig())
+
+	// Set the initial max window size.
+	initialMaxWindowSizeBytes := ctrl.minWindowSizeBytes * 10
+	ctrl.maxWindowSizeBytes = initialMaxWindowSizeBytes
+
+	// Register a loss for an unknown sequence number.
+	seqNum := uint16(1)
+	err := ctrl.OnLostPacket(seqNum, false, time.Now())
+	// Check the error.
+	require.ErrorIs(t, err, errUnknownSeqNum, "lost packet registration failed")
+
+	// The window sizes are unchanged.
+	require.Equal(t, uint32(0), ctrl.windowSizeBytes, "expected window size 0, got %d", ctrl.windowSizeBytes)
+	require.Equal(t, initialMaxWindowSizeBytes, ctrl.maxWindowSizeBytes,
+		"expected max window size %d, got %d", initialMaxWindowSizeBytes, ctrl.maxWindowSizeBytes)
+}
+
+// A timeout with packets in flight resets the window to one packet and
+// re-enters slow start.
+func TestOnTimeoutWithPacketsInFlight(t *testing.T) {
+	ctrl := newDefaultController(defaultCtrlConfig())
+	ctrl.slowStart = false
+
+	initialMaxWindowSizeBytes := ctrl.minWindowSizeBytes * 10
+	ctrl.maxWindowSizeBytes = initialMaxWindowSizeBytes
+	initialTimeout := ctrl.Timeout()
+
+	ctrl.OnTimeout(true)
+
+	require.Equal(t, ctrl.minWindowSizeBytes, ctrl.maxWindowSizeBytes,
+		"expected max window size %d, got %d", ctrl.minWindowSizeBytes, ctrl.maxWindowSizeBytes)
+	require.True(t, ctrl.slowStart, "a timeout with packets in flight must re-enter slow start")
+
+	expectedTimeout := initialTimeout * 2
+	require.Equal(t, expectedTimeout, ctrl.Timeout(),
+		"expected timeout %v, got %v", expectedTimeout, ctrl.Timeout())
+}
+
+// A timeout on an idle connection, with nothing in flight and so nothing
+// lost, decays the window by a third rather than collapsing it.
+func TestOnTimeoutWhileIdleDecaysGently(t *testing.T) {
+	ctrl := newDefaultController(defaultCtrlConfig())
+	ctrl.slowStart = false
+
+	initial := ctrl.minWindowSizeBytes * 30
+	ctrl.maxWindowSizeBytes = initial
+
+	ctrl.OnTimeout(false)
+
+	want := initial * 2 / 3
+	require.Equal(t, want, ctrl.maxWindowSizeBytes,
+		"an idle timeout should decay the window to two thirds (%d), got %d", want, ctrl.maxWindowSizeBytes)
+	require.False(t, ctrl.slowStart, "an idle timeout is not a loss signal and must not re-enter slow start")
+	require.Greater(t, ctrl.maxWindowSizeBytes, ctrl.minWindowSizeBytes,
+		"an idle timeout collapsed the window to its floor")
+}
+
+func TestOnTimeoutNotExceedMax(t *testing.T) {
+	config := defaultCtrlConfig()
+	config.InitialTimeout = 2 * time.Second
+	config.MaxTimeout = 3 * time.Second
+
+	ctrl := newDefaultController(config)
+
+	// Register a timeout.
+	ctrl.OnTimeout(true)
+
+	// The timeout is capped at max.
+	require.Equal(t, config.MaxTimeout, ctrl.Timeout(),
+		"expected timeout %v, got %v", config.MaxTimeout, ctrl.Timeout())
+}
+
+func TestPush(t *testing.T) {
+	window := 100 * time.Millisecond
+	acc := newDelayAccumulator(window)
+
+	delay := 50 * time.Millisecond
+	delayReceivedAt := time.Now()
+	acc.Push(delay, delayReceivedAt)
+
+	require.Equal(t, 1, acc.delays.len(), "delay not pushed onto accumulator")
+
+	item := acc.delays.front()
+	require.Equal(t, delay, item.Value,
+		"expected delay %v, got %v", delay, item.Value)
+	expectedDeadline := delayReceivedAt.Add(window)
+	require.Equal(t, expectedDeadline, item.Deadline,
+		"expected delay %v, got %v", expectedDeadline, item.Deadline)
+}
+
+func TestBaseDelay(t *testing.T) {
+	window := 100 * time.Millisecond
+	acc := newDelayAccumulator(window)
+
+	// The smallest sample first, received a window ago and so expired;
+	// then three newer ones, in the order acknowledgements arrive.
+	delayExpired := 1 * time.Millisecond
+	// Past the window by a margin: exactly a window ago is the boundary,
+	// and a coarse clock that has not moved since leaves it in.
+	delayExpiredReceivedAt := time.Now().Add(-window - time.Millisecond)
+	acc.Push(delayExpired, delayExpiredReceivedAt)
+
+	delaySmallest := 5 * time.Millisecond
+	acc.Push(delaySmallest, time.Now())
+
+	delaySmall := 50 * time.Millisecond
+	acc.Push(delaySmall, time.Now())
+
+	delaySmaller := 25 * time.Millisecond
+	acc.Push(delaySmaller, time.Now())
+
+	// The 50 ms sample is already gone: it can never be the least while the
+	// newer, smaller 25 ms one is in the window.
+	require.Equal(t, 3, acc.delays.len(), "expected 3 delays, got %d", acc.delays.len())
+
+	// Get the base delay.
+	baseDelay := acc.BaseDelay()
+	require.Equal(t, delaySmallest, baseDelay, "expected base delay %v, got %v", delaySmallest, baseDelay)
+	// The expired delay was removed.
+	require.Equal(t, 2, acc.delays.len(), "expected 2 delays, got %d", acc.delays.len())
+}
+
+func TestBaseDelayEmpty(t *testing.T) {
+	window := time.Millisecond * 100
+	acc := newDelayAccumulator(window)
+	baseDelay := acc.BaseDelay()
+	require.Equal(t, time.Duration(0), baseDelay, "expected base delay 0, got %v", baseDelay)
+}
+
+// The congestion window is halved at most once per maxWindowDecayInterval,
+// however many packets are declared lost in that span, so a burst of losses
+// from one queue overflow is one event.
+func TestWindowDecaysAtMostOncePerInterval(t *testing.T) {
+	ctrl := newDefaultController(defaultCtrlConfig())
+	initial := ctrl.minWindowSizeBytes * 64
+	ctrl.maxWindowSizeBytes = initial
+
+	now := time.Now()
+	for seqNum := uint16(1); seqNum <= 4; seqNum++ {
+		require.NoError(t, ctrl.OnTransmit(seqNum, transmitInitial, 32))
+	}
+
+	// Four losses in the same instant.
+	for seqNum := uint16(1); seqNum <= 4; seqNum++ {
+		require.NoError(t, ctrl.OnLostPacket(seqNum, true, now))
+	}
+	require.Equal(t, initial/2, ctrl.maxWindowSizeBytes,
+		"four losses in one instant halved the window %d times, not once",
+		func() int {
+			n := 0
+			for w := initial; w > ctrl.maxWindowSizeBytes; w /= 2 {
+				n++
+			}
+			return n
+		}())
+
+	// Still inside the interval: no further decay.
+	require.NoError(t, ctrl.OnTransmit(uint16(5), transmitInitial, 32))
+	require.NoError(t, ctrl.OnLostPacket(uint16(5), true, now.Add(maxWindowDecayInterval-time.Millisecond)))
+	require.Equal(t, initial/2, ctrl.maxWindowSizeBytes,
+		"a loss inside the decay interval halved the window again")
+
+	// Past the interval: decay again.
+	require.NoError(t, ctrl.OnTransmit(uint16(6), transmitInitial, 32))
+	require.NoError(t, ctrl.OnLostPacket(uint16(6), true, now.Add(maxWindowDecayInterval)))
+	require.Equal(t, initial/4, ctrl.maxWindowSizeBytes,
+		"a loss past the decay interval did not halve the window")
+}
+
+// A peer's reported delay cannot drive the window below what the round trip
+// allows: the delay fed to the controller is clamped to the minimum round
+// trip of the packets the acknowledgement covers. The delay arrives in the
+// timestamp-difference field of every incoming packet, a 32-bit number the
+// peer controls. Unclamped, a reported delay of 30 seconds against a 100 ms
+// target would take the window to its floor on one acknowledgement, whether
+// by malice, a clock step or a wrapped timestamp.
+func TestDelayClampedToRTT(t *testing.T) {
+	const (
+		rtt        = 20 * time.Millisecond
+		honest     = 5 * time.Millisecond
+		absurd     = 30 * time.Second
+		packetSize = 1400
+	)
+
+	// grow drives one honest transmit-and-acknowledge cycle.
+	grow := func(ctrl *defaultController, seq uint16, delay time.Duration, at time.Time) {
+		if err := ctrl.OnTransmit(seq, transmitInitial, packetSize); err != nil {
+			t.Fatalf("transmit %d: %v", seq, err)
+		}
+		if err := ackOne(ctrl, seq, ackSample{Delay: delay, RTT: rtt, ReceivedAt: at}); err != nil {
+			t.Fatalf("ack %d: %v", seq, err)
+		}
+	}
+
+	ctrl := newDefaultController(defaultCtrlConfig())
+	ctrl.slowStart = false
+	ctrl.maxWindowSizeBytes = 60 * packetSize
+
+	now := time.Now()
+	var seq uint16
+	for i := 0; i < 40; i++ {
+		seq++
+		grow(ctrl, seq, honest, now.Add(time.Duration(i)*rtt))
+	}
+	before := ctrl.maxWindowSizeBytes
+
+	// A peer that lies does not lie once: twenty acknowledgements is about a
+	// second of a hostile or broken peer.
+	for i := 0; i < 20; i++ {
+		seq++
+		grow(ctrl, seq, absurd, now.Add(time.Duration(41+i)*rtt))
+	}
+	after := ctrl.maxWindowSizeBytes
+
+	if before <= ctrl.minWindowSizeBytes*4 {
+		t.Fatalf("the window was only %d bytes (floor %d) before the poisoned ack; there is no "+
+			"room for a collapse to be visible", before, ctrl.minWindowSizeBytes)
+	}
+	// Clamped, the delay reads as 20ms against a 100ms target, which is under
+	// target, so the window holds or grows. A delay beyond the round trip
+	// also raises the base by the excess, so after the delay filter fills the
+	// lie reads as 20ms either way; the clamp covers the acknowledgements
+	// before that. So the test is that the window does not shrink at all.
+	if after < before {
+		t.Errorf("20 acknowledgements reporting %v of delay on a %v path took the window from "+
+			"%d bytes to %d (floor %d). libutp clamps the reported delay to the round trip "+
+			"(utp_internal.cpp:1615-1621) precisely so that a peer cannot do this",
+			absurd, rtt, before, after, ctrl.minWindowSizeBytes)
+	}
+	t.Logf("window %d -> %d bytes across 20 acknowledgements each claiming %v of delay on a "+
+		"%v path", before, after, absurd, rtt)
+}
+
+// An acknowledgement covering several packets updates the window once, for
+// all their bytes. Updating once per packet compounds, since each later
+// packet sees the window the earlier ones grew.
+func TestOneWindowUpdatePerAcknowledgement(t *testing.T) {
+	const (
+		packets    = 4
+		size       = 1000
+		rtt        = 50 * time.Millisecond
+		baseDelay  = 20 * time.Millisecond
+		queueDelay = 30 * time.Millisecond
+	)
+	fresh := func() *defaultController {
+		c := newDefaultController(defaultCtrlConfig())
+		c.maxWindowSizeBytes = 8 * size
+		c.lastMaxedOutWindow = time.Now() // not application-limited
+		// Establish the base delay the samples below are measured against.
+		c.OnAckDelay(baseDelay, time.Now())
+		c.OnAckDelay(baseDelay, time.Now())
+		c.OnAckDelay(baseDelay, time.Now())
+		return c
+	}
+	for _, slowStart := range []bool{true, false} {
+		c := fresh()
+		c.slowStart = slowStart
+		now := time.Now()
+		for s := uint16(1); s <= packets; s++ {
+			require.NoError(t, c.OnTransmit(s, transmitInitial, size))
+		}
+		for i := 0; i < 3; i++ {
+			c.OnAckDelay(baseDelay+queueDelay, now)
+		}
+		for s := uint16(1); s <= packets; s++ {
+			require.NoError(t, c.OnAck(s, ackSample{Delay: baseDelay + queueDelay, RTT: rtt, ReceivedAt: now}))
+		}
+		c.ApplyAck()
+
+		want := fresh()
+		want.slowStart = slowStart
+		want.applyCongestionControl(0, uint32(queueDelay.Microseconds()), packets*size, rtt, now, 0)
+		require.Equal(t, want.maxWindowSizeBytes, c.maxWindowSizeBytes,
+			"slow start %v: one acknowledgement of %d packets should be one update of %d bytes",
+			slowStart, packets, packets*size)
+		require.NotEqual(t, uint32(8*size), c.maxWindowSizeBytes, "slow start %v: the window did not move", slowStart)
+
+		// And a second ApplyAck, with nothing acknowledged since, is not a
+		// second update.
+		before := c.maxWindowSizeBytes
+		c.ApplyAck()
+		require.Equal(t, before, c.maxWindowSizeBytes)
+	}
+}
+
+// A one-way delay longer than the round trip cannot be queuing; it is the
+// clocks. The base is raised by the excess, so later samples read the path as
+// it is.
+func TestDelayOverTheRoundTripRaisesTheBase(t *testing.T) {
+	const (
+		rtt  = 20 * time.Millisecond
+		base = 10 * time.Millisecond
+	)
+	c := newDefaultController(defaultCtrlConfig())
+	now := time.Now()
+	c.OnAckDelay(base, now)
+	var seq uint16
+	ack := func(reported time.Duration) {
+		seq++
+		require.NoError(t, c.OnTransmit(seq, transmitInitial, 1000))
+		require.NoError(t, ackOne(c, seq, ackSample{Delay: reported, RTT: rtt, ReceivedAt: now}))
+	}
+	// Three acknowledgements 100ms over the base: the filter reads 100ms,
+	// 80ms more than the round trip allows.
+	for i := 0; i < 3; i++ {
+		ack(base + 100*time.Millisecond)
+	}
+	require.Equal(t, base+80*time.Millisecond, c.delayAcc.BaseDelay(),
+		"the base should have risen by the 80ms the delay exceeded the round trip by")
+	// The same reports now read as 20ms of queue.
+	for i := 0; i < 3; i++ {
+		ack(base + 100*time.Millisecond)
+	}
+	require.Equal(t, uint32(20000), c.filteredDelayMicros())
+}

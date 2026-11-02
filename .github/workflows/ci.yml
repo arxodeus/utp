@@ -1,0 +1,199 @@
+# The release gates: the quick ones on every push and pull request, the long
+# ones nightly or on demand. All of them pass on a commit before it is tagged.
+name: ci
+
+on:
+  push:
+  pull_request:
+  schedule:
+    - cron: "17 3 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  lint:
+    if: github.event_name != 'schedule'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+      - name: gofmt
+        run: test -z "$(gofmt -l . | tee /dev/stderr)"
+      - name: vet
+        run: go vet ./...
+      - name: cross-build
+        run: |
+          for target in linux/amd64 linux/arm64 linux/386 darwin/arm64 darwin/amd64 freebsd/amd64 windows/amd64; do
+            echo "== $target"
+            GOOS=${target%/*} GOARCH=${target#*/} CGO_ENABLED=0 go vet ./...
+          done
+
+  # On the current Go release, as vulncheck is: a staticcheck reads the export
+  # data of the Go it runs on, and one old enough to build on go.mod's minimum
+  # (2025.1.1) cannot read Go 1.27's ("export data version 5 is greater than
+  # maximum supported version 2"), so a contributor on a current Go could not
+  # run the gate this job runs. v0.8.2 needs Go 1.26 or later to build.
+  staticcheck:
+    if: github.event_name != 'schedule'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: stable
+      - run: go run honnef.co/go/tools/cmd/staticcheck@v0.8.2 ./...
+
+  # On the current Go release, not go.mod's minimum: a vulnerability in an
+  # older standard library is the toolchain's, fixed by building with a
+  # current one, and would fail this on every run.
+  vulncheck:
+    if: github.event_name != 'schedule'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: stable
+      - name: govulncheck
+        run: |
+          for m in . compat/golibutp internal/integration/nettest internal/integration/goutp internal/integration/anacrolix internal/integration/libutp; do
+            echo "== $m"
+            (cd "$m" && go run golang.org/x/vuln/cmd/govulncheck@v1.9.0 ./...)
+          done
+
+  test:
+    if: github.event_name != 'schedule'
+    strategy:
+      fail-fast: false
+      matrix:
+        go: [go.mod, stable]
+        cgo: ["0", "1"]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: ${{ matrix.go == 'go.mod' && 'go.mod' || '' }}
+          go-version: ${{ matrix.go == 'stable' && 'stable' || '' }}
+      - run: go test -short -timeout 30m ./...
+        env:
+          CGO_ENABLED: ${{ matrix.cgo }}
+
+  race:
+    if: github.event_name != 'schedule'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+      - run: go test -race -short -timeout 30m ./...
+
+  modules:
+    if: github.event_name != 'schedule'
+    strategy:
+      fail-fast: false
+      matrix:
+        module: [compat/golibutp, internal/integration/nettest, internal/integration/goutp, internal/integration/anacrolix]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: ${{ matrix.module }}/go.mod
+      - run: go test -timeout 30m ./...
+        working-directory: ${{ matrix.module }}
+      - name: race
+        run: go test -race -timeout 30m ./...
+        working-directory: ${{ matrix.module }}
+
+  # Interoperability with libutp. The root package's conformance tests replay
+  # transcripts recorded from libutp; here they run against libutp itself,
+  # through the libutp-driver program, and the transcripts are re-recorded
+  # and must not have changed.
+  libutp:
+    if: github.event_name != 'schedule'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: internal/integration/libutp/go.mod
+      - name: build libutp-driver
+        run: go build -o "$RUNNER_TEMP/libutp-driver" ./cmd/libutp-driver
+        working-directory: internal/integration/libutp
+      - name: vet
+        run: go vet ./...
+        working-directory: internal/integration/libutp
+      - name: interoperability tests
+        run: go test -short -timeout 30m ./...
+        working-directory: internal/integration/libutp
+      - name: race
+        run: go test -race -short -timeout 30m ./...
+        working-directory: internal/integration/libutp
+      - name: conformance against libutp
+        run: go test -timeout 60m .
+        env:
+          UTP_LIBUTP_DRIVER: ${{ runner.temp }}/libutp-driver
+          UTP_LIBUTP_RECORD: "1"
+      - name: recorded transcripts are up to date
+        run: |
+          git status --porcelain -- testdata/libutp
+          test -z "$(git status --porcelain -- testdata/libutp)"
+
+  platforms:
+    if: github.event_name != 'schedule'
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [macos-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+      - run: go test -short -timeout 30m ./...
+        env:
+          CGO_ENABLED: "0"
+
+  nightly:
+    if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    timeout-minutes: 300
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+      - name: full suite
+        run: go test -timeout 120m ./...
+      - name: full race suite
+        run: go test -race -timeout 120m ./...
+        env:
+          UTP_TEST_TRANSFERS: "50"
+      - name: build libutp-driver
+        run: go build -o "$RUNNER_TEMP/libutp-driver" ./cmd/libutp-driver
+        working-directory: internal/integration/libutp
+      - name: full libutp suite
+        run: go test -timeout 120m ./...
+        working-directory: internal/integration/libutp
+      - name: full libutp race suite
+        run: go test -race -timeout 120m ./...
+        working-directory: internal/integration/libutp
+      - name: pinned libutp reference
+        run: internal/integration/libutp/check-reference.sh
+      # The differential targets run against libutp itself: a new input has
+      # no recorded transcript.
+      - name: fuzz
+        env:
+          UTP_LIBUTP_DRIVER: ${{ runner.temp }}/libutp-driver
+        run: |
+          for target in FuzzDecodePacketHeader FuzzDecodePacket FuzzDecodeSelectiveAck FuzzResponderPacketSequence FuzzDifferentialResponder FuzzDifferentialInitiator; do
+            echo "== $target at $(git rev-parse HEAD), $(go version)"
+            go test -run xxx -fuzz "^$target\$" -fuzztime 5m .
+          done

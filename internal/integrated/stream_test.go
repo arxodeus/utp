@@ -1,0 +1,471 @@
+package integrated
+
+import (
+	"bytes"
+	"context"
+	"log/slog"
+	"os"
+	"sync"
+	"testing"
+	"time"
+
+	utp "github.com/arxodeus/utp"
+	"github.com/stretchr/testify/require"
+)
+
+// expectedIdleTimeout is what the tests that wait out an idle timeout set:
+// there is none by default, as in libutp.
+const expectedIdleTimeout = 60 * time.Second
+
+func TestCloseWhenWriteCompletes(t *testing.T) {
+	// Initialize logging
+	//logFile, _ := os.OpenFile("test_close_when_write_completes.log", os.O_CREATE|os.O_RDWR|os.O_APPEND, 0666)
+	//handler := slog.NewTextHandler(logFile, &slog.HandlerOptions{Level: utp.LevelTrace})
+
+	handler := slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{Level: utp.LevelTrace})
+	slog.SetDefault(slog.New(handler))
+
+	connConfig := utp.NewConnectionConfig()
+
+	// Create connected socket pair
+	aLink, aCid, bLink, bCid := buildConnectedPair()
+
+	ctx := context.Background()
+
+	// Create sockets
+	loggerA := slog.Default().With("local", "peerA")
+	aSocket := utp.NewSocket(ctx, aLink, loggerA)
+	loggerB := slog.Default().With("local", "peerB")
+	//loggerB := slog.New(log.DiscardHandler())
+	bSocket := utp.NewSocket(ctx, bLink, loggerB)
+
+	var wg sync.WaitGroup
+	wg.Add(2)
+
+	// Accept connection
+	var recvStream *utp.Stream
+	var recvErr error
+	go func() {
+		defer wg.Done()
+		slog.Debug("accepting with cid", "src.peer", bCid.Peer)
+		recvStream, recvErr = bSocket.AcceptWithCID(ctx, bCid, connConfig)
+		slog.Debug("accepted with cid", "src.peer", bCid.Peer)
+	}()
+
+	// Connect
+	var sendStream *utp.Stream
+	var sendErr error
+	go func() {
+		defer wg.Done()
+		slog.Debug("Connecting with cid", "dst.peer", aCid.Peer)
+		sendStream, sendErr = aSocket.ConnectWithCID(ctx, aCid, connConfig)
+		if sendErr != nil {
+			t.Error("failed to connect with cid", "dst.peer", aCid.Peer)
+		}
+		slog.Debug("Connected", "dst.peer", aCid.Peer)
+	}()
+
+	wg.Wait()
+
+	if sendErr != nil {
+		t.Fatalf("Connect error: %v", sendErr)
+	}
+	if recvErr != nil {
+		t.Fatalf("Accept error: %v", recvErr)
+	}
+
+	// Data to send
+	const dataLen = 1_000 * 50
+	data := bytes.Repeat([]byte{0xa5}, dataLen)
+
+	// Send data
+	var sendWg sync.WaitGroup
+	sendWg.Add(1)
+	go func() {
+		defer sendWg.Done()
+		slog.Debug("will write to", "dst.peer", sendStream.CID().Peer)
+		written, err := sendStream.Write(ctx, data)
+		if err != nil {
+			t.Errorf("Error sending data: %v", err)
+			return
+		}
+		if written != dataLen {
+			t.Errorf("Expected to write %d bytes, wrote %d", dataLen, written)
+		}
+	}()
+
+	// Receive data
+	var recvWg sync.WaitGroup
+	recvWg.Add(1)
+	go func() {
+		defer recvWg.Done()
+		readBuf := make([]byte, 0)
+		slog.Debug("will read from", "src.peer", recvStream.CID().Peer)
+		_, err := recvStream.ReadToEOF(ctx, &readBuf)
+		if err != nil {
+			t.Errorf("Error receiving data: %v", err)
+			return
+		}
+		if !bytes.Equal(readBuf, data) {
+			t.Error("Received data doesn't match sent data")
+		}
+	}()
+
+	// Wait for send to complete
+	sendWg.Wait()
+
+	// Close stream with timeout
+	closeCtx, cancel := context.WithTimeout(ctx, 160*time.Millisecond)
+	defer cancel()
+
+	done := make(chan struct{})
+	go func() {
+		sendStream.Close()
+		close(done)
+	}()
+
+	select {
+	case <-closeCtx.Done():
+		t.Fatal("Timeout closing stream")
+	case <-done:
+		// Close successful
+	}
+
+	// Wait for receive to complete
+	recvWg.Wait()
+}
+
+func TestCloseErrorsIfAllPacketsDropped(t *testing.T) {
+	handler := slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{Level: utp.LevelTrace})
+	slog.SetDefault(slog.New(handler))
+	connConfig := utp.NewConnectionConfig()
+	connConfig.MaxIdleTimeout = expectedIdleTimeout
+
+	// Create connected socket pair
+	aLink, aCid, bLink, bCid := buildConnectedPair()
+
+	// Create sockets
+	ctx := context.Background()
+	sendSocket := utp.NewSocket(ctx, aLink, slog.Default().With("local", "sender"))
+	recvSocket := utp.NewSocket(ctx, bLink, slog.Default().With("local", "receiver"))
+
+	var wg sync.WaitGroup
+	wg.Add(2)
+
+	// Accept connection
+	var recvStream *utp.Stream
+	var recvErr error
+	go func() {
+		defer wg.Done()
+		recvStream, recvErr = recvSocket.AcceptWithCID(ctx, bCid, connConfig)
+	}()
+
+	// Connect
+	var sendStream *utp.Stream
+	var sendErr error
+	go func() {
+		defer wg.Done()
+		sendStream, sendErr = sendSocket.ConnectWithCID(ctx, aCid, connConfig)
+	}()
+
+	wg.Wait()
+
+	if sendErr != nil {
+		t.Fatalf("Connect error: %v", sendErr)
+	}
+	if recvErr != nil {
+		t.Fatalf("Accept error: %v", recvErr)
+	}
+
+	// Disable network link, will not receive any packets
+	aLink.linkDecider.(*ManualLinkDecider).upSwitch.Store(false)
+
+	// Data to send
+	const dataLen = 100
+	data := bytes.Repeat([]byte{0xa5}, dataLen)
+
+	// Send data
+	var sendWg sync.WaitGroup
+	sendWg.Add(1)
+	go func() {
+		defer sendWg.Done()
+		written, err := sendStream.Write(ctx, data)
+		if err != nil {
+			t.Errorf("Error sending data: %v", err)
+			return
+		}
+		if written != dataLen {
+			t.Errorf("Expected to write %d bytes, wrote %d", dataLen, written)
+		}
+	}()
+
+	// Receive data
+	var recvWg sync.WaitGroup
+	recvWg.Add(1)
+	go func() {
+		defer recvWg.Done()
+		readBuf := make([]byte, 0)
+		_, err := recvStream.ReadToEOF(ctx, &readBuf)
+		if err == nil {
+			t.Error("Expected timeout error but got none")
+			return
+		}
+		require.ErrorIs(t, err, utp.ErrTimedOut, "Expected timeout error but got: %v", err)
+
+	}()
+
+	// Wait for send to complete
+	sendWg.Wait()
+
+	// Try to close stream with timeout.
+	// The budget must exceed the connection's own idle timeout: Close waits
+	// for the event loop, which cannot exit until the idle timer fires at
+	// expectedIdleTimeout. Giving Close exactly that long was a dead heat the
+	// test always lost. The rest of this file already uses a 2x budget.
+	closeCtx, cancel := context.WithTimeout(ctx, expectedIdleTimeout*2)
+	defer cancel()
+
+	done := make(chan struct{}, 1)
+	go func() {
+		sendStream.Close()
+		close(done)
+	}()
+
+	select {
+	case <-closeCtx.Done():
+		t.Fatal("Timeout closing stream")
+	case <-done:
+		// Close successful
+	}
+
+	// Wait for receive to complete
+	recvWg.Wait()
+}
+
+func TestCloseSucceedsIfOnlyFinAckDropped(t *testing.T) {
+	handler := slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{Level: utp.LevelTrace})
+	slog.SetDefault(slog.New(handler))
+	connConfig := utp.NewConnectionConfig()
+	connConfig.MaxIdleTimeout = expectedIdleTimeout
+
+	// Build connected pair
+	sendLink, sendCid, recvLink, recvCid := buildConnectedPair()
+
+	// Create UTP sockets
+	ctx := context.Background()
+	sendSocket := utp.NewSocket(ctx, sendLink, slog.Default().With("local", "sender"))
+	recvSocket := utp.NewSocket(ctx, recvLink, slog.Default().With("local", "receiver"))
+
+	// Create channels for coordination
+	var wg sync.WaitGroup
+	wg.Add(2)
+
+	// Accept connection in goroutine
+	var recvStream *utp.Stream
+	var recvErr error
+	go func() {
+		defer wg.Done()
+		recvStream, recvErr = recvSocket.AcceptWithCID(ctx, recvCid, connConfig)
+	}()
+
+	// Connect
+	var sendStream *utp.Stream
+	var sendErr error
+	go func() {
+		defer wg.Done()
+		sendStream, sendErr = sendSocket.ConnectWithCID(ctx, sendCid, connConfig)
+	}()
+
+	// Wait for connection establishment
+	wg.Wait()
+
+	if sendErr != nil {
+		t.Fatalf("Connect error: %v", sendErr)
+	}
+	if recvErr != nil {
+		t.Fatalf("Accept error: %v", recvErr)
+	}
+
+	// Data to send
+	const dataLen = 100
+	data := bytes.Repeat([]byte{0xa5}, dataLen)
+
+	// Send data
+	var sendWg sync.WaitGroup
+	sendWg.Add(1)
+	go func() {
+		defer sendWg.Done()
+		written, err := sendStream.Write(ctx, data)
+		if err != nil {
+			t.Errorf("Error sending data: %v", err)
+			return
+		}
+		if written != dataLen {
+			t.Errorf("Wrong number of bytes written. Expected %d, got %d", dataLen, written)
+			return
+		}
+	}()
+
+	// Receive data
+	recvComplete := make(chan struct{})
+	go func() {
+		readBuf := make([]byte, 0)
+		_, err := recvStream.ReadToEOF(ctx, &readBuf)
+		require.ErrorIs(t, err, utp.ErrTimedOut, "Expected timeout error but got none")
+		require.True(t, bytes.Equal(readBuf, data), "Received data doesn't match sent data")
+		close(recvComplete)
+	}()
+
+	// Wait for send to complete
+	sendWg.Wait()
+
+	// Wait for some time to ensure data is fully sent
+	time.Sleep(expectedIdleTimeout / 2)
+
+	// Disable network link
+	sendLink.linkDecider.(*ManualLinkDecider).upSwitch.Store(false)
+
+	// Try to close send stream with timeout
+	sendCloseDone := make(chan struct{})
+	go func() {
+		sendStream.Close()
+		close(sendCloseDone)
+	}()
+
+	select {
+	case <-sendCloseDone:
+	case <-time.After(expectedIdleTimeout * 2):
+		t.Error("The send stream timeout on close(), not fast enough")
+	}
+
+	// The reader has to finish before its stream is closed: closing it first
+	// drops whatever has not reached it yet, which is not what this checks.
+	select {
+	case <-recvComplete:
+	case <-time.After(expectedIdleTimeout * 2):
+		t.Error("the receiver did not finish reading")
+	}
+
+	// Try to close receive stream
+	recvCloseDone := make(chan struct{})
+	go func() {
+		recvStream.Close()
+		close(recvCloseDone)
+	}()
+
+	select {
+	case <-recvCloseDone:
+	case <-time.After(expectedIdleTimeout * 2):
+		t.Error("The recv stream did not timeout on close() fast enough")
+	}
+}
+
+func TestDataValidWhenResendingSynStateResponse(t *testing.T) {
+	handler := slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{Level: utp.LevelTrace})
+	slog.SetDefault(slog.New(handler))
+	connConfig := utp.NewConnectionConfig()
+
+	connectorSocket, connectorCid, acceptorSocket, acceptorCid := buildLinkDropSentPair(1)
+
+	// Create UTP sockets
+	ctx := context.Background()
+	acceptor := utp.NewSocket(ctx, acceptorSocket, slog.Default().With("local", "acceptor"))
+	connector := utp.NewSocket(ctx, connectorSocket, slog.Default().With("local", "connector"))
+
+	// Create channels for coordination
+	var wg sync.WaitGroup
+	wg.Add(2)
+
+	// Accept connection in goroutine
+	// Accept connection
+	var acceptorStream *utp.Stream
+	var acceptorErr error
+	go func() {
+		defer wg.Done()
+		acceptorStream, acceptorErr = acceptor.AcceptWithCID(ctx, acceptorCid, connConfig)
+	}()
+
+	// Connect
+	var connectorStream *utp.Stream
+	var connectorErr error
+	go func() {
+		defer wg.Done()
+		connectorStream, connectorErr = connector.ConnectWithCID(ctx, connectorCid, connConfig)
+	}()
+
+	// Wait for connection establishment
+	wg.Wait()
+	if acceptorErr != nil {
+		t.Fatalf("Accept error: %v", acceptorErr)
+	}
+
+	if connectorErr != nil {
+		t.Fatalf("Connect error: %v", connectorErr)
+	}
+
+	// Data to send
+	const dataLen = 9000
+	data := bytes.Repeat([]byte{0xa5}, dataLen)
+
+	var sendWg sync.WaitGroup
+	sendWg.Add(1)
+	go func() {
+		defer sendWg.Done()
+		written, err := acceptorStream.Write(ctx, data)
+		if err != nil {
+			t.Errorf("Error sending data: %v", err)
+			return
+		}
+		if written != dataLen {
+			t.Errorf("Wrong number of bytes written. Expected %d, got %d", dataLen, written)
+			return
+		}
+	}()
+
+	// Receive data
+	recvComplete := make(chan struct{})
+	go func() {
+		readBuf := make([]byte, 0)
+		_, err := connectorStream.ReadToEOF(ctx, &readBuf)
+		require.Nil(t, err, "Expected nil but got an error")
+		require.True(t, bytes.Equal(readBuf, data), "Received data doesn't match sent data")
+		close(recvComplete)
+	}()
+
+	// Wait for send to complete
+	sendWg.Wait()
+
+	// Try to close send stream with timeout
+	acceptorCloseDone := make(chan struct{})
+	go func() {
+		acceptorStream.Close()
+		close(acceptorCloseDone)
+	}()
+
+	select {
+	case <-acceptorCloseDone:
+	case <-time.After(expectedIdleTimeout * 2):
+		t.Error("The send stream timeout on close(), not fast enough")
+	}
+
+	// The reader has to finish before its stream is closed: closing it first
+	// drops whatever has not reached it yet, which is not what this checks.
+	select {
+	case <-recvComplete:
+	case <-time.After(expectedIdleTimeout * 2):
+		t.Error("the receiver did not finish reading")
+	}
+
+	// Try to close receive stream
+	connectorCloseDone := make(chan struct{})
+	go func() {
+		connectorStream.Close()
+		close(connectorCloseDone)
+	}()
+
+	select {
+	case <-connectorCloseDone:
+	case <-time.After(expectedIdleTimeout * 2):
+		t.Error("The recv stream did not timeout on close() fast enough")
+	}
+}

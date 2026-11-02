@@ -1,0 +1,316 @@
+package utp
+
+import (
+	"context"
+	"net"
+	"sync"
+	"testing"
+	"time"
+)
+
+// fakePathMTU is a Conn that answers PathMTU, so the composition rule can be
+// tested independently of this machine's interfaces.
+type fakePathMTU struct {
+	Conn
+	mtu   int
+	ok    bool
+	local net.Addr
+}
+
+func (f *fakePathMTU) PathMTU(ConnectionPeer) (int, bool) { return f.mtu, f.ok }
+
+// LocalAddr is forwarded explicitly: Socket.LocalAddr checks for it, and
+// embedding the Conn interface promotes only Conn's methods.
+func (f *fakePathMTU) LocalAddr() net.Addr { return f.local }
+
+// plainConn is a Conn with no PathMTU method: the ordinary case, which must
+// be unaffected.
+type plainConn struct{ Conn }
+
+func pathMTUTestPeer(t *testing.T) ConnectionPeer {
+	t.Helper()
+	addr, err := net.ResolveUDPAddr("udp", "203.0.113.7:6881")
+	if err != nil {
+		t.Fatal(err)
+	}
+	return NewUDPPeer(addr)
+}
+
+// A discovered path MTU may lower the configured ceiling and never raise it.
+// Loopback reports 65536 and jumbo-frame links 9000, which are not ceilings
+// the search should start from.
+func TestPathMTUCeilingOnlyLowers(t *testing.T) {
+	peer := pathMTUTestPeer(t)
+	const configured = uint16(1400)
+
+	cases := []struct {
+		name       string
+		socket     Conn
+		want       uint16
+		wantReason string
+	}{
+		{"no PathMTU method", &plainConn{}, configured,
+			"a Conn that cannot answer must be left exactly as it was"},
+		{"provider declines", &fakePathMTU{ok: false, mtu: 1232}, configured,
+			"a false second return means no answer, whatever the first says"},
+		{"narrower path", &fakePathMTU{ok: true, mtu: 1232}, 1232,
+			"an IPv6 minimum link is the case this exists for"},
+		{"wireguard default", &fakePathMTU{ok: true, mtu: 1420 - 28}, 1392,
+			"a tunnel a little under the configured ceiling"},
+		{"wider path", &fakePathMTU{ok: true, mtu: 8972}, configured,
+			"a jumbo-frame link must not raise the ceiling"},
+		{"loopback", &fakePathMTU{ok: true, mtu: 65488}, configured,
+			"nothing here wants a 65-kilobyte datagram"},
+		{"exactly equal", &fakePathMTU{ok: true, mtu: int(configured)}, configured, ""},
+		{"zero", &fakePathMTU{ok: true, mtu: 0}, configured,
+			"a zero is not an answer"},
+		{"negative", &fakePathMTU{ok: true, mtu: -1}, configured, ""},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			got := pathMTUCeiling(c.socket, peer, configured)
+			if got != c.want {
+				t.Errorf("ceiling %d, want %d: %s", got, c.want, c.wantReason)
+			}
+		})
+	}
+
+	// A nil peer is no reason to guess.
+	if got := pathMTUCeiling(&fakePathMTU{ok: true, mtu: 900}, nil, configured); got != configured {
+		t.Errorf("ceiling %d for a nil peer, want %d", got, configured)
+	}
+}
+
+// With MaxPacketSize raised, the reported path MTU sets the ceiling.
+func TestPathMTUSetsTheCeilingUnderARaisedMaximum(t *testing.T) {
+	peer := pathMTUTestPeer(t)
+	if got := pathMTUCeiling(&fakePathMTU{ok: true, mtu: 1472}, peer, 65535); got != 1472 {
+		t.Errorf("ceiling %d under a 65535 maximum and a 1472 report, want 1472", got)
+	}
+}
+
+// The header arithmetic.
+func TestDatagramSizeForInterfaceMTU(t *testing.T) {
+	v4 := net.ParseIP("192.0.2.1")
+	v6 := net.ParseIP("2001:db8::1")
+
+	cases := []struct {
+		mtu   int
+		ip    net.IP
+		want  int
+		wantK bool
+	}{
+		{1500, v4, 1472, true},   // Ethernet
+		{1420, v4, 1392, true},   // WireGuard's default
+		{1280, v6, 1232, true},   // IPv6's floor
+		{1500, v6, 1452, true},   // IPv6 over Ethernet: a bigger header
+		{65536, v4, 65508, true}, // loopback
+		{604, v4, 576, true},     // exactly the absolute floor
+		{603, v4, 0, false},      // one below it
+		{576, v4, 0, false},      // a link that cannot carry 576 of payload
+		{0, v4, 0, false},
+	}
+	for _, c := range cases {
+		got, ok := datagramSizeForInterfaceMTU(c.mtu, c.ip)
+		if got != c.want || ok != c.wantK {
+			t.Errorf("datagramSizeForInterfaceMTU(%d, %v) = (%d, %v), want (%d, %v)",
+				c.mtu, c.ip, got, ok, c.want, c.wantK)
+		}
+	}
+}
+
+// Discovery against this machine. The value depends on the host, but its
+// relationship to the interface it came from can be checked.
+func TestPathMTUDiscoveryAgreesWithTheInterface(t *testing.T) {
+	loopback, err := net.ResolveUDPAddr("udp", "127.0.0.1:9")
+	if err != nil {
+		t.Fatal(err)
+	}
+	got, ok := pathMTUFor(loopback)
+	if !ok {
+		t.Skip("no route to loopback reported an interface MTU on this host")
+	}
+
+	// Find the loopback interface and check the arithmetic end to end.
+	ifaces, err := net.Interfaces()
+	if err != nil {
+		t.Fatal(err)
+	}
+	var want int
+	for _, iface := range ifaces {
+		addrs, err := iface.Addrs()
+		if err != nil {
+			continue
+		}
+		for _, a := range addrs {
+			if ipNet, ok := a.(*net.IPNet); ok && ipNet.IP.Equal(net.IPv4(127, 0, 0, 1)) {
+				want = iface.MTU - int(ipv4HeaderAndUDPOverhead)
+			}
+		}
+	}
+	if want == 0 {
+		t.Skip("127.0.0.1 is not on any interface this host reports")
+	}
+	if got != want {
+		t.Errorf("discovered %d for loopback, want %d (interface MTU less the "+
+			"IPv4 and UDP headers)", got, want)
+	}
+	t.Logf("loopback carries %d-byte datagrams", got)
+}
+
+// A socket whose Conn reports a narrow path builds its connections with a
+// correspondingly narrow ceiling, read back through ConnectionMetrics, and
+// still works.
+func TestNarrowPathLowersTheConnectionCeiling(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	lg := duplexQuietLog()
+
+	// Put the narrow-path answer in front of a real UDP socket before the
+	// uTP socket is built over it; wrapping it afterwards would race the
+	// read loop.
+	const narrow = 1232 // an IPv6 minimum link
+	base, err := net.ListenUDP("udp", &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	narrowConn := &fakePathMTU{
+		Conn:  &udpConn{base: base},
+		mtu:   narrow,
+		ok:    true,
+		local: base.LocalAddr(),
+	}
+	sa := NewSocket(ctx, narrowConn, lg)
+	defer sa.Close()
+
+	sb, err := Bind(ctx, "udp", &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1)}, lg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer sb.Close()
+
+	aAddr := sa.LocalAddr().(*net.UDPAddr)
+	bAddr := sb.LocalAddr().(*net.UDPAddr)
+
+	cidA := NewConnectionID(NewUDPPeer(bAddr), 5000, 5001)
+	cidB := NewConnectionID(NewUDPPeer(aAddr), 5001, 5000)
+
+	// Collected under a lock rather than through a channel: the observer
+	// runs on the connection's goroutine for its whole life, so there is no
+	// safe moment to close a channel.
+	var (
+		mu       sync.Mutex
+		ceilings []uint32
+	)
+	cfg := NewConnectionConfig()
+	configured := cfg.MaxPacketSize
+	cfg.MetricsInterval = 5 * time.Millisecond
+	cfg.Metrics = func(m ConnectionMetrics) {
+		mu.Lock()
+		ceilings = append(ceilings, m.MtuCeiling)
+		mu.Unlock()
+	}
+
+	accepted := make(chan *Stream, 1)
+	go func() {
+		s, err := sb.AcceptWithCID(ctx, cidB, NewConnectionConfig())
+		if err != nil {
+			accepted <- nil
+			return
+		}
+		accepted <- s
+	}()
+	client, err := sa.ConnectWithCID(ctx, cidA, cfg)
+	if err != nil {
+		t.Fatalf("connect: %v", err)
+	}
+	server := <-accepted
+	if server == nil {
+		t.Fatal("accept failed")
+	}
+	defer server.Close()
+	defer client.Close()
+
+	// The caller's config comes back unmodified: it may be reused for the
+	// next connection.
+	if cfg.MaxPacketSize != configured {
+		t.Errorf("the caller's config was modified: MaxPacketSize is now %d, was %d",
+			cfg.MaxPacketSize, configured)
+	}
+
+	payload := make([]byte, 256*1024)
+	writeDone := make(chan error, 1)
+	go func() {
+		_, err := client.Write(ctx, payload)
+		writeDone <- err
+	}()
+	got := make([]byte, 0, len(payload))
+	readCtx, readCancel := context.WithTimeout(ctx, 20*time.Second)
+	defer readCancel()
+	for len(got) < len(payload) {
+		buf := make([]byte, 64*1024)
+		n, err := server.Read(readCtx, buf)
+		if err != nil {
+			t.Fatalf("read after %d bytes: %v", len(got), err)
+		}
+		got = append(got, buf[:n]...)
+	}
+	if err := <-writeDone; err != nil {
+		t.Fatalf("write: %v", err)
+	}
+
+	mu.Lock()
+	observed := append([]uint32(nil), ceilings...)
+	mu.Unlock()
+
+	sawNarrow := false
+	var highest uint32
+	for _, c := range observed {
+		if c > highest {
+			highest = c
+		}
+		if c == narrow {
+			sawNarrow = true
+		}
+	}
+	t.Logf("configured ceiling %d, discovered %d, highest observed %d",
+		configured, narrow, highest)
+	if !sawNarrow {
+		t.Errorf("no sample reported the discovered ceiling of %d; highest was %d",
+			narrow, highest)
+	}
+	if highest > narrow {
+		t.Errorf("the ceiling reached %d, above the %d the path was said to carry",
+			highest, narrow)
+	}
+}
+
+// An IPv6 peer gets the IPv6 ceiling, 1232; anything else keeps what was
+// configured.
+func TestIPv6PeersGetTheIPv6SafeCeiling(t *testing.T) {
+	v6 := &net.UDPAddr{IP: net.ParseIP("2001:db8::1"), Port: 6881}
+	for _, tc := range []struct {
+		name       string
+		peer       ConnectionPeer
+		configured uint16
+		want       uint16
+	}{
+		{"IPv6 peer", NewUDPPeer(v6), 1400, 1232},
+		{"zoned link-local IPv6 peer", NewUDPPeer(&net.UDPAddr{IP: net.ParseIP("fe80::1"), Zone: "eth0", Port: 1}), 1400, 1232},
+		{"IPv6 peer, smaller ceiling configured", NewUDPPeer(v6), 1000, 1000},
+		{"IPv4 peer", NewUDPPeer(&net.UDPAddr{IP: net.IPv4(192, 0, 2, 1), Port: 6881}), 1400, 1400},
+		{"IPv4-mapped IPv6 peer travels as IPv4", NewUDPPeer(&net.UDPAddr{IP: net.ParseIP("::ffff:192.0.2.1"), Port: 6881}), 1400, 1400},
+		{"peer without an address", fakePeerHash("somewhere"), 1400, 1400},
+	} {
+		if got := ipv6Ceiling(tc.peer, tc.configured); got != tc.want {
+			t.Errorf("%s: ceiling %d, want %d", tc.name, got, tc.want)
+		}
+	}
+	if ipv6SafeDatagram != 1232 {
+		t.Errorf("ipv6SafeDatagram is %d, want libutp's UDP_TEREDO_MTU, 1232", ipv6SafeDatagram)
+	}
+}
+
+type fakePeerHash string
+
+func (p fakePeerHash) Hash() string { return string(p) }

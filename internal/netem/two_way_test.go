@@ -1,0 +1,111 @@
+package netem
+
+import (
+	"context"
+	"fmt"
+	"sort"
+	"sync"
+	"testing"
+	"time"
+
+	utp "github.com/arxodeus/utp"
+)
+
+// Data both ways at once over a lossy path, where the peer's
+// acknowledgements ride on its data packets rather than arriving as
+// ST_STATE. The writer must wake for those too, or one direction can sit with
+// data queued, nothing in flight and room in its window until some timer
+// fires. Eight runs make an intermittent stall likely to show.
+func TestTwoWayTransferOverLoss(t *testing.T) {
+	if testing.Short() {
+		t.Skip("not a -short test")
+	}
+	const (
+		size  = 1 << 20
+		runs  = 8
+		bound = 15 * time.Second // the median is about 5 s; the stall was about 36
+	)
+	cfg := Config{Delay: 20 * time.Millisecond, LossRate: 0.05, BandwidthBps: 20_000_000, QueueBytes: 128 * 1024}
+	var times []time.Duration
+	for seed := 0; seed < runs; seed++ {
+		el, err := twoWayTransfer(int64(2000+seed), cfg, size)
+		if err != nil {
+			t.Fatalf("seed %d: %v", seed, err)
+		}
+		times = append(times, el)
+		if el > bound {
+			t.Errorf("seed %d: 1 MB each way took %v; one direction stalled", seed, el)
+		}
+	}
+	sort.Slice(times, func(i, j int) bool { return times[i] < times[j] })
+	t.Logf("1 MB each way, 20 Mb/s, 20 ms, 5%% loss, %d runs: median %v, max %v",
+		runs, times[len(times)/2].Round(time.Millisecond), times[len(times)-1].Round(time.Millisecond))
+}
+
+// twoWayTransfer opens one connection and has both ends write size bytes and
+// read the other's size bytes at the same time.
+func twoWayTransfer(seed int64, cfg Config, size int) (time.Duration, error) {
+	n := NewNetwork(seed)
+	defer n.Close()
+	a := n.MustAddEndpoint("a")
+	b := n.MustAddEndpoint("b")
+	n.ConnectAsymmetric(a, b, cfg, cfg)
+	ctx, cancel := context.WithTimeout(context.Background(), 120*time.Second)
+	defer cancel()
+	pair := NewUtpPair(ctx, n, a, b, Quiet())
+
+	var sa, sb *utp.Stream
+	var errA, errB error
+	var wg sync.WaitGroup
+	wg.Add(2)
+	go func() {
+		defer wg.Done()
+		sb, errB = pair.SockB.AcceptWithCID(ctx, utp.NewConnectionID(a.Addr(), 501, 500), utp.NewConnectionConfig())
+	}()
+	go func() {
+		defer wg.Done()
+		sa, errA = pair.SockA.ConnectWithCID(ctx, utp.NewConnectionID(b.Addr(), 500, 501), utp.NewConnectionConfig())
+	}()
+	wg.Wait()
+	if errA != nil || errB != nil {
+		return 0, fmt.Errorf("connect: %v, accept: %v", errA, errB)
+	}
+	defer sa.Close()
+	defer sb.Close()
+
+	data := make([]byte, size)
+	var mu sync.Mutex
+	var failed error
+	fail := func(err error) {
+		mu.Lock()
+		if failed == nil {
+			failed = err
+		}
+		mu.Unlock()
+	}
+	start := time.Now()
+	side := func(s *utp.Stream) {
+		defer wg.Done()
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			if _, err := s.Write(ctx, data); err != nil {
+				fail(fmt.Errorf("write: %w", err))
+			}
+		}()
+		buf := make([]byte, 64*1024)
+		for got := 0; got < size; {
+			k, err := s.Read(ctx, buf)
+			got += k
+			if err != nil {
+				fail(fmt.Errorf("read after %d bytes: %w", got, err))
+				return
+			}
+		}
+	}
+	wg.Add(2)
+	go side(sa)
+	go side(sb)
+	wg.Wait()
+	return time.Since(start), failed
+}

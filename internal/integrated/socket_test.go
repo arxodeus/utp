@@ -1,0 +1,566 @@
+package integrated
+
+import (
+	"bytes"
+	"context"
+	"crypto/rand"
+	"fmt"
+	"io"
+	"log/slog"
+	"net"
+	"os"
+	"path/filepath"
+	"strconv"
+	"strings"
+	"sync"
+	"testing"
+	"time"
+
+	utp "github.com/arxodeus/utp"
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
+)
+
+const (
+	testSocketDataLen   = 1_000_000
+	defaultNumTransfers = 1000
+	// raceNumTransfers is the default under the race detector. All the
+	// transfers share one receiving socket, whose buffer the kernel caps at
+	// net.core.rmem_max, 208 KB on a stock Linux host: about 150 packets,
+	// against 2000 in flight from 1000 connections even at their minimum
+	// window. With the reader slowed by the race detector the socket then
+	// drops a large share of what arrives, and a connection down to one
+	// packet can lose every retransmission and give up, as the protocol
+	// says it should. 250 completes there with room to spare.
+	raceNumTransfers = 250
+)
+
+// numTransfers is the concurrency this test runs at. Set UTP_TEST_TRANSFERS
+// to run the same test at another size: 1000 concurrent 1 MB transfers take
+// several GB of memory, and much more under the race detector.
+func numTransfers() int {
+	if raceEnabled {
+		return envInt("UTP_TEST_TRANSFERS", raceNumTransfers)
+	}
+	return envInt("UTP_TEST_TRANSFERS", defaultNumTransfers)
+}
+
+// udpReceiveBufferErrors returns the kernel's count of UDP datagrams dropped
+// for want of socket buffer space, system-wide, where the platform reports
+// it (Linux).
+func udpReceiveBufferErrors() (int64, bool) {
+	b, err := os.ReadFile("/proc/net/snmp")
+	if err != nil {
+		return 0, false
+	}
+	lines := strings.Split(string(b), "\n")
+	for i := 0; i+1 < len(lines); i++ {
+		names, values := strings.Fields(lines[i]), strings.Fields(lines[i+1])
+		if len(names) == 0 || names[0] != "Udp:" || len(values) != len(names) {
+			continue
+		}
+		for j, name := range names {
+			if name == "RcvbufErrors" {
+				n, err := strconv.ParseInt(values[j], 10, 64)
+				return n, err == nil
+			}
+		}
+	}
+	return 0, false
+}
+
+func TestManyConcurrentTransfers(t *testing.T) {
+	// Profile with go test -cpuprofile rather than from inside the test.
+
+	// profile name: allocs
+	// profile name: block
+	// profile name: goroutine
+	// profile name: heap
+	// profile name: mutex
+	// profile name: threadcreate
+	//goFile, _ := os.Create("concurrency_goroutine.prof")
+	//goProfile := pprof.Lookup("goroutine")
+	//go goProfile.WriteTo(goFile, 0)
+	//defer goFile.Close()
+
+	//go func() {
+	//	if err := http.ListenAndServe("0.0.0.0:6060", nil); err != nil {
+	//		log.Error("Failure in running pprof server", "err", err)
+	//	}
+	//}()
+
+	// // 内存分析
+	//memFile, _ := os.Create("concurrency_mem.prof")
+	//defer func() {
+	//	_ = pprof.WriteHeapProfile(memFile)
+	//}()
+
+	// Initialize logging
+	// Warnings and up, from this run only: a failed transfer prints its
+	// connection's lines from both (logLinesFor).
+	logFile1, _ := os.OpenFile(filepath.Join(t.TempDir(), "recv.log"), os.O_CREATE|os.O_RDWR|os.O_TRUNC, 0666)
+	logFile2, _ := os.OpenFile(filepath.Join(t.TempDir(), "send.log"), os.O_CREATE|os.O_RDWR|os.O_TRUNC, 0666)
+	transferLogs = []string{logFile1.Name(), logFile2.Name()}
+	// Closed before TempDir removes them -- cleanups run last first -- and
+	// after the sockets, which the deferred Closes below shut first. Windows
+	// will not delete a file that is open.
+	t.Cleanup(func() {
+		_ = logFile1.Close()
+		_ = logFile2.Close()
+	})
+	//handler := slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{Level: utp.LevelTrace})
+	handler1 := slog.NewTextHandler(logFile1, &slog.HandlerOptions{Level: slog.LevelWarn})
+	handler2 := slog.NewTextHandler(logFile2, &slog.HandlerOptions{Level: slog.LevelWarn})
+	//handler1 := log.NewTerminalHandler(logFile1, false)
+	//handler2 := log.NewTerminalHandler(logFile2, false)
+	logger1 := slog.New(handler1)
+	logger2 := slog.New(handler2)
+
+	//logger1 := slog.Default()
+	//logger2 := slog.Default()
+	t.Logf("opened trace: %v", logger2.Enabled(context.Background(), utp.LevelTrace))
+	t.Logf("opened info: %v", logger2.Enabled(context.Background(), slog.LevelInfo))
+	t.Logf("opened warn: %v", logger2.Enabled(context.Background(), slog.LevelWarn))
+	t.Logf("opened error: %v", logger2.Enabled(context.Background(), slog.LevelError))
+
+	t.Log("starting socket test")
+
+	// Setup addresses
+	recvAddr := &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1), Port: 3400}
+	sendAddr := &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1), Port: 3401}
+
+	//recvAddr, _ := net.ResolveUDPAddr("udp4", "0.0.0.0:3400")
+	//sendAddr, _ := net.ResolveUDPAddr("udp4", "0.0.0.0:3401")
+
+	ctx := context.Background()
+	//recv, _, send, _ := buildConnectedPair()
+	// Create sockets
+	//recvLink := utp.NewSocket(ctx, recv, logger1.With("local", ":3400"))
+	recvLink, err := utp.Bind(ctx, "udp4", recvAddr, logger1.With("local", ":3400"))
+	if err != nil {
+		t.Fatalf("Failed to bind recv socket: %v", err)
+	}
+	defer recvLink.Close()
+
+	//sendLink := utp.NewSocket(ctx, send, logger2.With("local", ":3401"))
+	sendLink, err := utp.Bind(ctx, "udp4", sendAddr, logger2.With("local", ":3401"))
+	if err != nil {
+		t.Fatalf("Failed to bind send socket: %v", err)
+	}
+	defer sendLink.Close()
+	// Create wait group for all transfers
+	var wg sync.WaitGroup
+	start := time.Now()
+	dropsBefore, haveDrops := udpReceiveBufferErrors()
+
+	data := make([]byte, testSocketDataLen)
+	_, _ = io.ReadFull(rand.Reader, data)
+
+	// Start transfers
+	n := numTransfers()
+	for i := 0; i < n; i++ {
+		wg.Add(2) // One for sender, one for receiver
+		initiateTransfer(
+			t, ctx,
+			uint16(i*2),
+			recvAddr,
+			recvLink,
+			sendAddr,
+			sendLink,
+			data,
+			&wg)
+	}
+	budget := 2 * time.Minute
+	if raceEnabled {
+		// The race detector costs roughly an order of magnitude here.
+		budget = 10 * time.Minute
+	}
+	timeoutCtx, cancel := context.WithTimeout(ctx, budget)
+	go func() {
+		// Wait for all transfers in a separate goroutine
+		wg.Wait()
+		cancel()
+	}()
+
+	<-timeoutCtx.Done()
+	require.ErrorIs(t, timeoutCtx.Err(), context.Canceled, "Timed out waiting for transfer to complete")
+
+	elapsed := time.Since(start)
+	megabitsSent := float64(n) * float64(testSocketDataLen) * 8.0 / 1_000_000.0
+	transferRate := megabitsSent / elapsed.Seconds()
+
+	t.Logf("finished high concurrency load test of %d simultaneous transfers, in %v, at a rate of %.0f Mbps",
+		n, elapsed, transferRate)
+	if dropsAfter, ok := udpReceiveBufferErrors(); ok && haveDrops {
+		t.Logf("the kernel dropped %d UDP datagrams for want of socket buffer space meanwhile",
+			dropsAfter-dropsBefore)
+	}
+
+	// A connection's event queue carries packets only until its event loop
+	// is ready, and here a thousand set up at once. Anything it dropped would
+	// be a loss of ours, not the network's (utp.connEventQueueLen).
+	if d := recvLink.PacketsDroppedFullConnQueue() + sendLink.PacketsDroppedFullConnQueue(); d != 0 {
+		t.Errorf("%d packets dropped because a connection's event queue was full", d)
+	}
+}
+
+// TestUDPTransfer performs a single large transfer over uTP on real UDP
+// sockets, the path a BitTorrent client uses.
+func TestUDPTransfer(t *testing.T) {
+	handler := slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelError + 4})
+	logger := slog.New(handler)
+
+	recvAddr := &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1), Port: 3600}
+	sendAddr := &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1), Port: 3601}
+
+	ctx := context.Background()
+	recvLink, err := utp.Bind(ctx, "udp4", recvAddr, logger)
+	require.NoError(t, err, "Failed to bind recv socket")
+	defer recvLink.Close()
+	sendLink, err := utp.Bind(ctx, "udp4", sendAddr, logger)
+	require.NoError(t, err, "Failed to bind send socket")
+	defer sendLink.Close()
+
+	hugeData := make([]byte, 16*1024*1024)
+	_, err = io.ReadFull(rand.Reader, hugeData)
+	require.NoError(t, err)
+	length := len(hugeData)
+
+	connConfig := utp.NewConnectionConfig()
+	const initiatorCid, responderCid = 3700, 3701
+	recvCid := utp.NewConnectionID(utp.NewUDPPeer(sendAddr), responderCid, initiatorCid)
+	sendCid := utp.NewConnectionID(utp.NewUDPPeer(recvAddr), initiatorCid, responderCid)
+
+	start := time.Now()
+	var wg sync.WaitGroup
+	wg.Add(2)
+
+	var recvErr error
+	var recvBuf []byte
+	go func() {
+		defer wg.Done()
+		stream, err := recvLink.AcceptWithCID(ctx, recvCid, connConfig)
+		if err != nil {
+			recvErr = fmt.Errorf("accept: %w", err)
+			return
+		}
+		defer stream.Close()
+		buf := make([]byte, 0, length)
+		n, err := stream.ReadToEOF(ctx, &buf)
+		if err != nil && err != io.EOF {
+			recvErr = fmt.Errorf("read: %w", err)
+			return
+		}
+		if n != length {
+			recvErr = fmt.Errorf("short read: got %d want %d", n, length)
+			return
+		}
+		recvBuf = buf
+	}()
+
+	var sendErr error
+	go func() {
+		defer wg.Done()
+		stream, err := sendLink.ConnectWithCID(ctx, sendCid, connConfig)
+		if err != nil {
+			sendErr = fmt.Errorf("connect: %w", err)
+			return
+		}
+		defer stream.Close()
+		n, err := stream.Write(ctx, hugeData)
+		if err != nil {
+			sendErr = fmt.Errorf("write: %w", err)
+			return
+		}
+		if n != length {
+			sendErr = fmt.Errorf("short write: got %d want %d", n, length)
+		}
+	}()
+
+	done := make(chan struct{})
+	go func() { wg.Wait(); close(done) }()
+	select {
+	case <-done:
+	case <-time.After(transferBudget()):
+		t.Fatalf("transfer did not complete within %v", transferBudget())
+	}
+
+	require.NoError(t, sendErr)
+	require.NoError(t, recvErr)
+	require.True(t, bytes.Equal(hugeData, recvBuf), "received data does not match sent data")
+
+	elapsed := time.Since(start)
+	megabytesSent := float64(length) / 1_000_000.0
+	transferRate := megabytesSent * 8.0 / elapsed.Seconds()
+	t.Logf(
+		"finished single large transfer test with %.0f MB, in %v, at a rate of %.1f Mbps (loopback)",
+		megabytesSent,
+		elapsed,
+		transferRate,
+	)
+}
+
+func TestManyTimeHugeData(t *testing.T) {
+	//cpuFile, _ := os.Create("cpu.prof")
+	//pprof.StartCPUProfile(cpuFile)
+	//defer pprof.StopCPUProfile()
+	for i := 0; i < 1; i++ {
+		OneHugeDataTransfer(t, i*2)
+	}
+}
+
+func OneHugeDataTransfer(t *testing.T, i int) {
+	// CPU 分析
+	//cpuFile, _ := os.Create("cpu.prof")
+	//pprof.StartCPUProfile(cpuFile)
+	//defer pprof.StopCPUProfile()
+
+	// trace 分析
+	//traceFile, _ := os.Create("trace.prof")
+	//trace.Start(traceFile)
+	//defer trace.Stop()
+	// 内存分析
+
+	// 创建50MB的测试数据
+	//hugeData := bytes.Repeat([]byte{0xf0}, 1024*1024*15)
+	hugeData := make([]byte, 1024*1024*50)
+
+	_, _ = io.ReadFull(rand.Reader, hugeData)
+
+	t.Log("starting single transfer of huge data test")
+
+	recvAddr := &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1), Port: 3500 + i}
+	sendAddr := &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1), Port: 3501 + i}
+
+	//// Initialize logging
+	//logFile1, _ := os.OpenFile(fmt.Sprintf("test_one_huge_data_transfer_%d.log", recvAddr.Port), os.O_CREATE|os.O_RDWR|os.O_APPEND, 0666)
+	//logFile2, _ := os.OpenFile(fmt.Sprintf("test_one_huge_data_transfer_%d.log", sendAddr.Port), os.O_CREATE|os.O_RDWR|os.O_APPEND, 0666)
+	////handler := slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{Level: utp.LevelTrace})
+	//handler1 := log.NewTerminalHandler(logFile1, false)
+	//handler2 := log.NewTerminalHandler(logFile2, false)
+	//logger1 := slog.New(handler1)
+	//logger2 := slog.New(handler2)
+
+	logger1 := slog.Default()
+	logger2 := slog.Default()
+
+	ctx := context.Background()
+	recv, err := utp.Bind(ctx, "udp", recvAddr, logger1.With("local", fmt.Sprintf(":%d", recvAddr.Port)))
+	require.NoError(t, err, "Failed to bind recv socket")
+	send, err := utp.Bind(ctx, "udp", sendAddr, logger2.With("local", fmt.Sprintf(":%d", sendAddr.Port)))
+	require.NoError(t, err, "Failed to bind send socket")
+
+	defer func() {
+		recv.Close()
+		send.Close()
+	}()
+	start := time.Now()
+
+	var wg sync.WaitGroup
+	wg.Add(2)
+
+	// 启动传输
+	go func() {
+		initiateTransfer(t, ctx, uint16(2), recvAddr, recv, sendAddr, send, hugeData, &wg)
+	}()
+
+	// 等待接收完成
+	timeoutCtx, cancel := context.WithTimeout(ctx, 500*time.Second)
+	go func() {
+		wg.Wait()
+		cancel()
+	}()
+
+	<-timeoutCtx.Done()
+	require.ErrorIs(t, timeoutCtx.Err(), context.Canceled, "Timed out waiting for transfer to complete")
+
+	elapsed := time.Since(start)
+	megabytesSent := float64(len(hugeData)) / 1_000_000.0
+	megabitsSent := megabytesSent * 8.0
+	transferRate := megabitsSent / elapsed.Seconds()
+
+	t.Logf(
+		"finished single large transfer test with %.0f MB, in %v, at a rate of %.1f Mbps",
+		megabytesSent,
+		elapsed,
+		transferRate,
+	)
+}
+
+func TestEmptySocketConnCount(t *testing.T) {
+	socketAddr := &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1), Port: 3402}
+
+	// 假设我们有一个 utp.Socket 的包装结构
+	utpSocket, err := utp.Bind(context.Background(), "udp", socketAddr, nil)
+	require.NoError(t, err, "Failed to bind socket")
+	defer utpSocket.Close()
+
+	require.Equal(t, 0, utpSocket.NumConnections(), "Expected 0 connections, got %d", utpSocket.NumConnections())
+}
+
+func TestSocketReportsTwoConns(t *testing.T) {
+	ctx := context.Background()
+	connConfig := utp.NewConnectionConfig()
+	// create receive socket
+	recvAddr := &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1), Port: 3404}
+	recv, err := utp.Bind(ctx, "udp", recvAddr, nil)
+	require.NoError(t, err, "Failed to bind recv socket")
+
+	// 创建发送socket
+	sendAddr := &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1), Port: 3405}
+	send, err := utp.Bind(ctx, "udp", sendAddr, nil)
+	require.NoError(t, err, "Failed to bind send socket")
+
+	// 定义连接ID
+	recvOneCid := &utp.ConnectionID{
+		Send: 100,
+		Recv: 101,
+		Peer: utp.NewUDPPeer(sendAddr),
+	}
+	sendOneCid := &utp.ConnectionID{
+		Send: 101,
+		Recv: 100,
+		Peer: utp.NewUDPPeer(recvAddr),
+	}
+
+	recvTwoCid := &utp.ConnectionID{
+		Send: 200,
+		Recv: 201,
+		Peer: utp.NewUDPPeer(sendAddr),
+	}
+	sendTwoCid := &utp.ConnectionID{
+		Send: 201,
+		Recv: 200,
+		Peer: utp.NewUDPPeer(recvAddr),
+	}
+
+	var wg sync.WaitGroup
+	wg.Add(4)
+
+	// 启动第一对连接
+	go func() {
+		defer wg.Done()
+		_, _ = recv.AcceptWithCID(ctx, recvOneCid, connConfig)
+	}()
+
+	go func() {
+		defer wg.Done()
+		_, _ = send.ConnectWithCID(ctx, sendOneCid, connConfig)
+	}()
+
+	// 启动第二对连接
+	go func() {
+		defer wg.Done()
+		_, _ = recv.AcceptWithCID(ctx, recvTwoCid, connConfig)
+	}()
+
+	go func() {
+		defer wg.Done()
+		_, _ = send.ConnectWithCID(ctx, sendTwoCid, connConfig)
+	}()
+
+	wg.Wait()
+
+	if recv.NumConnections() != 2 {
+		t.Errorf("Expected 2 connections for receiver, got %d", recv.NumConnections())
+	}
+	if send.NumConnections() != 2 {
+		t.Errorf("Expected 2 connections for sender, got %d", send.NumConnections())
+	}
+}
+
+func initiateTransfer(
+	t *testing.T,
+	ctx context.Context,
+	i uint16,
+	recvAddr *net.UDPAddr,
+	recv *utp.Socket,
+	sendAddr *net.UDPAddr,
+	send *utp.Socket,
+	data []byte,
+	wg *sync.WaitGroup) {
+	connConfig := utp.NewConnectionConfig()
+	initiatorCid := uint16(100) + i
+	responderCid := uint16(100) + i + 1
+
+	recvCid := utp.NewConnectionID(utp.NewUDPPeer(sendAddr), responderCid, initiatorCid)
+
+	sendCid := utp.NewConnectionID(utp.NewUDPPeer(recvAddr), initiatorCid, responderCid)
+
+	// Start receiver goroutine
+	go func() {
+		defer func() {
+			t.Log("recv wg done")
+			wg.Done()
+		}()
+		stream, err := recv.AcceptWithCID(ctx, recvCid, connConfig)
+		if err != nil {
+			panic(fmt.Errorf("accept failed: %w", err))
+		}
+
+		buf := make([]byte, 0)
+		n, err := stream.ReadToEOF(ctx, &buf)
+		if err != nil && err != io.EOF {
+			assert.NoError(t, err, "CID send=%d recv=%d read to eof error: %v",
+				recvCid.Send, recvCid.Recv, err)
+			logLinesFor(t, recvCid.Send, recvCid.Recv)
+		}
+		t.Logf("CID send=%d recv=%d read %d bytes from uTP stream",
+			recvCid.Send, recvCid.Recv, n)
+		assert.Equal(t, len(data), n,
+			"received wrong number of bytes: got %d, want %d", n, len(data))
+		assert.True(t, bytes.Equal(data, buf),
+			"received data doesn't match sent data")
+		stream.Close()
+	}()
+
+	// Start sender goroutine
+	go func() {
+		defer func() {
+			t.Log("writer wg done")
+			wg.Done()
+		}()
+		stream, err := send.ConnectWithCID(ctx, sendCid, connConfig)
+		assert.NoError(t, err, "connect failed: %w", err)
+		require.NotNil(t, stream, "stream should not be nil")
+		n, err := stream.Write(ctx, data)
+		assert.NoError(t, err, "write failed: %w", err)
+
+		assert.Equal(t, len(data), n,
+			"sent wrong number of bytes: got %d, want %d", n, len(data))
+		stream.Close()
+	}()
+}
+
+// transferBudget is the wall-clock allowance for a single large transfer.
+func transferBudget() time.Duration {
+	if raceEnabled {
+		return 10 * time.Minute
+	}
+	return 120 * time.Second
+}
+
+// transferLogs are the files TestManyConcurrentTransfers logs to, receiver's
+// first.
+var transferLogs []string
+
+// logLinesFor prints what both sockets logged about one transfer: the
+// receiving connection's lines, which carry its ids as they are, and the
+// sending one's, which carry them the other way round.
+func logLinesFor(t *testing.T, send, recv uint16) {
+	t.Helper()
+	ours := fmt.Sprintf("cid.send=%d cid.recv=%d", send, recv)
+	theirs := fmt.Sprintf("cid.send=%d cid.recv=%d", recv, send)
+	for _, name := range transferLogs {
+		data, err := os.ReadFile(name)
+		if err != nil {
+			t.Logf("%s: %v", name, err)
+			continue
+		}
+		for _, line := range strings.Split(string(data), "\n") {
+			if strings.Contains(line, ours) || strings.Contains(line, theirs) {
+				t.Logf("%s: %s", filepath.Base(name), line)
+			}
+		}
+	}
+}

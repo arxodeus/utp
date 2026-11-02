@@ -1,0 +1,270 @@
+package utp
+
+import (
+	"bytes"
+	"context"
+	"testing"
+	"time"
+)
+
+// A retransmission timeout resends one packet, the oldest, and the rest
+// follow as acknowledgements come back: every packet in flight is marked for
+// resend, and they go out as the window allows or one per acknowledgement
+// through the fast-timeout retry.
+func TestRetransmissionTimeoutResendsOnlyTheOldest(t *testing.T) {
+	t.Run("ack opens the window", func(t *testing.T) { rtoResendCase(t, 1<<20, false) })
+	// An acknowledgement advertising less than a packet of room leaves
+	// processWrites unable to send, so only the fast-timeout retry can bring
+	// the next packet back. Without this case the fast timeout could be
+	// missing and the other case would still pass.
+	t.Run("ack leaves less than a packet of room", func(t *testing.T) { rtoResendCase(t, 100, true) })
+}
+
+func rtoResendCase(t *testing.T, ackWindow uint32, belowOnePacket bool) {
+	const (
+		ourSeq  = 0x4321
+		peerID  = 6000
+		peerSeq = 900
+		step    = 10 * time.Millisecond
+	)
+
+	vc := newVirtualAccepted(t, 4000)
+	clk, conn, stream, ctx := vc.clk, vc.conn, vc.stream, vc.ctx
+	_ = step
+
+	// Room for four packets. The opening window is two, and a packet is
+	// full-size from the start (the MTU search starts at its ceiling), so on
+	// its own the window would hold two, not enough for the resend loop
+	// below. Set while the connection is parked; the clock's barrier orders
+	// it before the loop next runs.
+	clk.AwaitQuiet()
+	stream.conn.testWidenCongestionWindow(4 * 4000)
+	clk.AwaitQuiet()
+
+	// Write more than the window holds, so packets are in flight with more
+	// waiting behind them. The writer is not a virtual-clock participant, so
+	// wait for its packets in real time.
+	go func() { _, _ = stream.Write(ctx, bytes.Repeat([]byte("x"), 20000)) }()
+	waitFor(t, 5*time.Second, func() bool { return conn.emittedCount() > 0 })
+	clk.AwaitQuiet()
+	first := dataPackets(t, conn.takeEmitted())
+	if len(first) < 3 {
+		t.Fatalf("%d data packets in flight; this case needs at least three, or "+
+			"the resend loop in processWrites is never exercised", len(first))
+	}
+	oldest := seqOf(t, first[0])
+	t.Logf("%d packets in flight, oldest %d", len(first), oldest)
+
+	// Say nothing, and wait for the timeout.
+	var atTimeout [][]byte
+	var waited time.Duration
+	for waited < 30*time.Second && len(atTimeout) == 0 {
+		clk.Advance(step)
+		waited += step
+		atTimeout = dataPackets(t, conn.takeEmitted())
+	}
+	if len(atTimeout) == 0 {
+		t.Fatalf("nothing resent within %v", waited)
+	}
+	if len(atTimeout) != 1 || seqOf(t, atTimeout[0]) != oldest {
+		t.Fatalf("at the timeout (%v) sent %s; libutp resends one packet, the "+
+			"oldest (%d) -- utp_internal.cpp:1249-1251", waited,
+			describePackets(atTimeout), oldest)
+	}
+
+	// Nothing else leaves before the next deadline: the others wait for an
+	// acknowledgement or for the next timeout.
+	for i := 0; i < 50; i++ {
+		clk.Advance(step)
+		if more := dataPackets(t, conn.takeEmitted()); len(more) != 0 {
+			t.Fatalf("%v after the timeout, with nothing acknowledged, sent %s",
+				time.Duration(i+1)*step, describePackets(more))
+		}
+	}
+
+	// The acknowledgement for the oldest brings the next oldest back first,
+	// ahead of anything new: the fast-timeout retry, then the rest in order.
+	clk.AwaitReactionTo(func() {
+		conn.inject(newPacketBuilder(stState, peerID+1, 250000, ackWindow, peerSeq+2).
+			WithAckNum(oldest).Build().Encode())
+	})
+	clk.Advance(step)
+	after := dataPackets(t, conn.takeEmitted())
+	if len(after) == 0 {
+		t.Fatal("the acknowledgement for the resent packet drew nothing")
+	}
+	if got := seqOf(t, after[0]); got != oldest+1 {
+		t.Fatalf("after the acknowledgement for %d, sent %s first; the next "+
+			"oldest (%d) goes before anything else", oldest, describePackets(after), oldest+1)
+	}
+	if belowOnePacket && len(after) != 1 {
+		t.Fatalf("with %d bytes of peer window, sent %s; only the fast-timeout "+
+			"retry should have gone", ackWindow, describePackets(after))
+	}
+	for i := 1; i < len(after); i++ {
+		if seqOf(t, after[i]) != seqOf(t, after[i-1])+1 {
+			t.Fatalf("after the acknowledgement, sent out of order: %s", describePackets(after))
+		}
+	}
+	if !belowOnePacket {
+		// What the window lets out is what was declared lost at the timeout,
+		// oldest first, before any new data. The timeout cut the window to
+		// two packets, so not all of it need fit.
+		if len(after) < 2 {
+			t.Fatalf("after the acknowledgement, sent %s; a window of two packets "+
+				"has room for more than the fast-timeout retry", describePackets(after))
+		}
+		for i := 0; i < len(after) && i < len(first)-1; i++ {
+			if got, want := seqOf(t, after[i]), oldest+1+uint16(i); got != want {
+				t.Fatalf("after the acknowledgement, sent %s; the packets still owed "+
+					"(%d..%d) go first", describePackets(after), oldest+1, oldest+uint16(len(first)-1))
+			}
+		}
+	}
+}
+
+func dataPackets(t *testing.T, emitted [][]byte) [][]byte {
+	t.Helper()
+	var out [][]byte
+	for _, b := range emitted {
+		pkt, err := decodePacket(b, false)
+		if err != nil {
+			t.Fatalf("emitted packet does not decode: %v", err)
+		}
+		if pkt.Header.PacketType == stData {
+			out = append(out, b)
+		}
+	}
+	return out
+}
+
+func seqOf(t *testing.T, b []byte) uint16 {
+	t.Helper()
+	pkt, err := decodePacket(b, false)
+	if err != nil {
+		t.Fatalf("packet does not decode: %v", err)
+	}
+	return pkt.Header.SeqNum
+}
+
+// virtualAccepted is a connection we accepted, on the virtual clock, with
+// the handshake completed by one data packet from the peer.
+type virtualAccepted struct {
+	clk    *virtualClock
+	conn   *scriptedConn
+	stream *Stream
+	ctx    context.Context
+}
+
+// newVirtualAccepted accepts a connection with our sequence number pinned to
+// 0x4321, the peer's id 6000 and its first sequence number 900. maxPacket, if
+// nonzero, sets MaxPacketSize.
+func newVirtualAccepted(t *testing.T, maxPacket uint16) *virtualAccepted {
+	t.Helper()
+	const (
+		ourSeq  = 0x4321
+		peerID  = 6000
+		peerSeq = 900
+	)
+	start := time.Unix(0, 0).Add(time.Hour)
+	clk := newVirtualClock(start)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	t.Cleanup(cancel)
+	t.Cleanup(pinRandom(ourSeq))
+
+	conn := newScriptedConn()
+	sock := NewSocket(ctx, conn, conformanceLogger(), withClock(clk))
+	t.Cleanup(func() { sock.Close() })
+
+	cfg := NewConnectionConfig()
+	cfg.clock = clk
+	cfg.nowMicros = func() uint32 { return uint32(clk.Now().UnixMicro()) }
+	if maxPacket != 0 {
+		cfg.MaxPacketSize = maxPacket
+	}
+
+	cid := NewConnectionID(conn.peer, peerID+1, peerID)
+	accepted := make(chan *Stream, 1)
+	go func() {
+		stream, err := sock.AcceptWithCID(ctx, cid, cfg)
+		if err == nil {
+			accepted <- stream
+		}
+	}()
+
+	clk.AwaitParticipants(3)
+	clk.AwaitQuiet()
+	clk.AwaitReactionTo(func() {
+		conn.inject(newPacketBuilder(stSyn, peerID, 100000, 1<<20, peerSeq).Build().Encode())
+	})
+	var stream *Stream
+	select {
+	case stream = <-accepted:
+	case <-time.After(10 * time.Second):
+		t.Fatal("the accept did not complete within 10s of the SYN")
+	}
+	clk.AwaitParticipants(4)
+	clk.AwaitQuiet()
+	// Complete the handshake as a peer would, with data that acknowledges our
+	// SYN-ACK.
+	clk.AwaitReactionTo(func() {
+		conn.inject(newPacketBuilder(stData, peerID+1, 150000, 1<<20, peerSeq+1).
+			WithAckNum(ourSeq - 1).WithPayload([]byte("hi")).Build().Encode())
+	})
+	conn.takeEmitted()
+	return &virtualAccepted{clk: clk, conn: conn, stream: stream, ctx: ctx}
+}
+
+// writeOne writes b and returns the data packets it drew.
+func (v *virtualAccepted) writeOne(t *testing.T, b []byte) [][]byte {
+	t.Helper()
+	go func() { _, _ = v.stream.Write(v.ctx, b) }()
+	waitFor(t, 5*time.Second, func() bool { return v.conn.emittedCount() > 0 })
+	v.clk.AwaitQuiet()
+	return dataPackets(t, v.conn.takeEmitted())
+}
+
+// An acknowledgement that retires everything in flight restarts the
+// retransmission deadline, so the next packet's timeout runs from its own
+// send rather than from an earlier packet's.
+func TestAckRetiringEverythingRestartsTheDeadline(t *testing.T) {
+	const (
+		ourSeq  = 0x4321
+		peerID  = 6000
+		peerSeq = 900
+	)
+	vc := newVirtualAccepted(t, 0)
+
+	first := vc.writeOne(t, []byte("first"))
+	if len(first) != 1 {
+		t.Fatalf("first write sent %d packets", len(first))
+	}
+	vc.clk.Advance(100 * time.Millisecond)
+	vc.clk.AwaitReactionTo(func() {
+		vc.conn.inject(newPacketBuilder(stState, peerID+1, 250000, 1<<20, peerSeq+2).
+			WithAckNum(seqOf(t, first[0])).Build().Encode())
+	})
+	vc.conn.takeEmitted()
+
+	vc.clk.Advance(100 * time.Millisecond)
+	second := vc.writeOne(t, []byte("second"))
+	if len(second) != 1 {
+		t.Fatalf("second write sent %d packets", len(second))
+	}
+
+	// One RTT sample of 100ms puts the timeout at its 1000ms floor.
+	var waited time.Duration
+	for waited < 5*time.Second {
+		vc.clk.Advance(5 * time.Millisecond)
+		waited += 5 * time.Millisecond
+		if again := dataPackets(t, vc.conn.takeEmitted()); len(again) > 0 {
+			break
+		}
+	}
+	if waited > time.Second+defaultRetransmitTickInterval {
+		t.Errorf("the second packet was resent %v after it was sent; with a 1s timeout "+
+			"and the first packet acknowledged, it is owed a resend within one wheel tick of 1s",
+			waited)
+	}
+}

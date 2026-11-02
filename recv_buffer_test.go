@@ -1,0 +1,341 @@
+package utp
+
+import (
+	"bytes"
+	"math"
+	"reflect"
+	"testing"
+
+	"github.com/stretchr/testify/require"
+)
+
+const recvSize = 1024
+
+func TestRecvBufferAvailable(t *testing.T) {
+	initSeqNum := uint16(0xFFFF)
+	buf := newReceiveBuffer(recvSize, initSeqNum)
+
+	if buf.Available() != recvSize {
+		t.Errorf("expected available size to be %d, got %d", recvSize, buf.Available())
+	}
+
+	const dataLen = 256
+	data := make([]byte, dataLen)
+	for i := range data {
+		data[i] = 0xef
+	}
+
+	// Write an out-of-order packet.
+	seqNum := initSeqNum + 2
+	err := buf.Write(data, seqNum)
+	require.NoError(t, err, "failed to write data")
+	if buf.Available() != recvSize-dataLen {
+		t.Errorf("expected available size to be %d, got %d", recvSize-dataLen, buf.Available())
+	}
+
+	// Write an in-order packet.
+	seqNum = initSeqNum + 1
+	err = buf.Write(data, seqNum)
+	require.NoError(t, err, "failed to write data")
+	if buf.Available() != recvSize-(dataLen*2) {
+		t.Errorf("expected available size to be %d, got %d", recvSize-(dataLen*2), buf.Available())
+	}
+
+	// Read all data.
+	readBuf := make([]byte, dataLen*2)
+	n := buf.Read(readBuf)
+	if n != dataLen*2 {
+		t.Errorf("expected to read %d bytes, got %d", dataLen*2, n)
+	}
+	if buf.Available() != recvSize {
+		t.Errorf("expected available size to be %d, got %d", recvSize, buf.Available())
+	}
+}
+
+func TestWasWritten(t *testing.T) {
+	initSeqNum := uint16(0xFFFF)
+	buf := newReceiveBuffer(recvSize, initSeqNum)
+
+	seqNum := initSeqNum + 2
+	if buf.WasWritten(seqNum) {
+		t.Errorf("expected seqNum %d to not be written", seqNum)
+	}
+
+	const dataLen = 64
+	data := make([]byte, dataLen)
+	for i := range data {
+		data[i] = 0xef
+	}
+	err := buf.Write(data, seqNum)
+	require.NoError(t, err, "failed to write data")
+	if !buf.WasWritten(seqNum) {
+		t.Errorf("expected seqNum %d to be written", seqNum)
+	}
+}
+
+func TestRecvBufferWrite(t *testing.T) {
+	initSeqNum := uint16(0xFFFF)
+	buf := newReceiveBuffer(recvSize, initSeqNum)
+
+	const dataLen = 256
+
+	// Write an out-of-order packet.
+	dataSecond := make([]byte, dataLen)
+	for i := range dataSecond {
+		dataSecond[i] = 0xef
+	}
+	seqNum := initSeqNum + 2
+	err := buf.Write(dataSecond, seqNum)
+	require.NoError(t, err, "failed to write data")
+	require.Equal(t, 0, buf.offset)
+	require.Equal(t, uint16(0), buf.consumed)
+	data := buf.pending.Get(&pendingItem{seqNum: seqNum}).(*pendingItem)
+	require.NotNil(t, data)
+	require.True(t, bytes.Equal(dataSecond, data.data))
+
+	// Write an in-order packet.
+	dataFirst := make([]byte, dataLen)
+	for i := range dataFirst {
+		dataFirst[i] = 0xfe
+	}
+	seqNum = initSeqNum + 1
+	err = buf.Write(dataFirst, seqNum)
+	require.NoError(t, err, "failed to write data")
+
+	require.Equal(t, dataLen*2, buf.offset)
+	require.Equal(t, uint16(2), buf.consumed)
+	require.Equal(t, 0, buf.pending.Len())
+	require.True(t, bytes.Equal(dataFirst, buf.buf[:dataLen]))
+	require.True(t, bytes.Equal(dataSecond, buf.buf[dataLen:dataLen*2]))
+}
+
+// Refused while the buffer holds something to read: the reader will free
+// room. With nothing readable the next packet is taken whatever its size
+// (receiveBuffer.Admits), so this holds one byte first.
+func TestRecvBufferWriteExceedsAvailable(t *testing.T) {
+
+	initSeqNum := uint16(0xFFFF)
+	buf := newReceiveBuffer(recvSize, initSeqNum)
+
+	seqNum := initSeqNum + 1
+	require.NoError(t, buf.Write([]byte{1}, seqNum))
+	data := make([]byte, recvSize)
+	for i := range data {
+		data[i] = 0xef
+	}
+	err := buf.Write(data, seqNum+1)
+	require.Error(t, err)
+}
+
+func TestRecvBufferRead(t *testing.T) {
+	initSeqNum := uint16(0xFFFF)
+	buf := newReceiveBuffer(recvSize, initSeqNum)
+
+	const dataLen = 256
+
+	// Write an out-of-order packet.
+	dataSecond := make([]byte, dataLen)
+	for i := range dataSecond {
+		dataSecond[i] = 0xef
+	}
+	seqNum := initSeqNum + 2
+	err := buf.Write(dataSecond, seqNum)
+	require.NoError(t, err, "failed to write data")
+
+	readBuf := make([]byte, recvSize)
+	n := buf.Read(readBuf)
+	if n != 0 {
+		t.Errorf("expected to read 0 bytes, got %d", n)
+	}
+
+	// Write an in-order packet.
+	dataFirst := make([]byte, dataLen)
+	for i := range dataFirst {
+		dataFirst[i] = 0xfe
+	}
+	seqNum = initSeqNum + 1
+	err = buf.Write(dataFirst, seqNum)
+	require.NoError(t, err, "failed to write data")
+
+	n = buf.Read(readBuf)
+	if n != dataLen*2 {
+		t.Errorf("expected to read %d bytes, got %d", dataLen*2, n)
+	}
+	if buf.offset != 0 {
+		t.Errorf("expected buffer offset to be 0, got %d", buf.offset)
+	}
+	if !bytes.Equal(readBuf[:dataLen], dataFirst) || !bytes.Equal(readBuf[dataLen:dataLen*2], dataSecond) {
+		t.Errorf("unexpected data read from buffer")
+	}
+
+	n = buf.Read(readBuf)
+	if n != 0 {
+		t.Errorf("expected to read 0 bytes, got %d", n)
+	}
+}
+
+func TestAckNum(t *testing.T) {
+	initSeqNum := uint16(0xFFFF)
+	buf := newReceiveBuffer(recvSize, initSeqNum)
+
+	if buf.AckNum() != initSeqNum {
+		t.Errorf("expected ackNum to be %d, got %d", initSeqNum, buf.AckNum())
+	}
+
+	const dataLen = 64
+	data := make([]byte, dataLen)
+	for i := range data {
+		data[i] = 0xef
+	}
+
+	// Write an out-of-order packet.
+	secondSeqNum := initSeqNum + 2
+	err := buf.Write(data, secondSeqNum)
+	require.NoError(t, err, "failed to write data to receive buffer")
+
+	if buf.AckNum() != initSeqNum {
+		t.Errorf("expected ackNum to be %d, got %d", initSeqNum, buf.AckNum())
+	}
+
+	// Write an in-order packet.
+	firstSeqNum := initSeqNum + 1
+	err = buf.Write(data, firstSeqNum)
+	require.NoError(t, err, "failed to write data to receive buffer")
+
+	if buf.AckNum() != secondSeqNum {
+		t.Errorf("expected ackNum to be %d, got %d", secondSeqNum, buf.AckNum())
+	}
+}
+
+func TestSelectiveAck(t *testing.T) {
+	initSeqNum := uint16(0xFFFF)
+	buf := newReceiveBuffer(recvSize, initSeqNum)
+
+	selectiveAck := buf.SelectiveAck()
+	if selectiveAck != nil {
+		t.Errorf("expected no selective ack, got %v", selectiveAck)
+	}
+
+	const dataLen = 64
+	data := make([]byte, dataLen)
+	for i := range data {
+		data[i] = 0xef
+	}
+
+	// Write an out-of-order packet.
+	seqNum := initSeqNum + 2
+	err := buf.Write(data, seqNum)
+	require.NoError(t, err, "failed to write data to receive buffer")
+
+	selectiveAck = buf.SelectiveAck()
+	if selectiveAck == nil || !selectiveAck.Acked()[0] {
+		t.Errorf("expected selective ack with first packet acked, got %v", selectiveAck)
+	}
+
+	// Write an in-order packet.
+	seqNum = initSeqNum + 1
+	err = buf.Write(data, seqNum)
+	require.NoError(t, err, "failed to write data to receive buffer")
+
+	selectiveAck = buf.SelectiveAck()
+	if selectiveAck != nil {
+		t.Errorf("expected no selective ack, got %v", selectiveAck)
+	}
+}
+
+func TestSelectiveACKOverflow(t *testing.T) {
+	initSeqNum := uint16(math.MaxUint16) - 2
+	buf := newReceiveBuffer(recvSize, initSeqNum)
+
+	// Initially there is no selective ack.
+	nilSelectiveAck := buf.SelectiveAck()
+	require.Nil(t, nilSelectiveAck, "Expected no selective ACK initially")
+
+	data := make([]byte, 64)
+	for i := range data {
+		data[i] = 0xef
+	}
+
+	// Write out-of-order packets; uint16 arithmetic wraps.
+	seqNum := uint16(initSeqNum + 2) // 65533 + 2 = 65535 (overflow)
+	buf.Write(data, seqNum)
+
+	seqNum = initSeqNum + 3 // 65533 + 3 = 0 (overflow)
+	buf.Write(data, seqNum)
+
+	seqNum = initSeqNum + 5 // 65534 + 5 = 2 (overflow)
+	buf.Write(data, seqNum)
+
+	// Check the selective ack.
+	notNilSelectiveAck := buf.SelectiveAck()
+	require.NotNil(t, notNilSelectiveAck, "Expected a selective ACK initially")
+	acked := notNilSelectiveAck.Acked()
+	require.NotNil(t, acked, "Expected a acked list")
+
+	// The expected bitmap.
+	expected := make([]bool, 32)
+	expected[0] = true // sequence number 0
+	expected[1] = true // sequence number 1
+	expected[3] = true // sequence number 3
+
+	require.True(t, reflect.DeepEqual(notNilSelectiveAck.Acked(), expected),
+		"Expected acked %v, got %v", expected, notNilSelectiveAck.Acked())
+}
+
+// The selective-ack bitfield is a fixed 30-entry window starting at
+// ack_nr+2, and encodes to exactly four bytes, whatever is pending.
+func TestSelectiveAckWindowIsBounded(t *testing.T) {
+	buf := newReceiveBuffer(2*1024*1024, 100)
+
+	// A gap at 101, one packet just past it, and one far past the window.
+	for _, seq := range []uint16{102, 100 + 2 + uint16(selectiveAckWindow) + 5} {
+		if err := buf.Write([]byte("x"), seq); err != nil {
+			t.Fatalf("write seq %d: %v", seq, err)
+		}
+	}
+
+	ack := buf.SelectiveAck()
+	if ack == nil {
+		t.Fatal("no selective ack with packets pending past a gap")
+	}
+	if got := ack.EncodedLen(); got != 4 {
+		t.Errorf("selective ack encoded to %d bytes, want 4: libutp always writes one 4-byte word", got)
+	}
+
+	acked := ack.Acked()
+	if len(acked) != 32 {
+		t.Fatalf("bitfield holds %d entries, want 32", len(acked))
+	}
+	// Entry i reports on ack_nr + 2 + i, so 102 is entry 0.
+	if !acked[0] {
+		t.Error("102 is pending but entry 0 is clear; the bitfield does not start at ack_nr+2")
+	}
+	for i := 1; i < len(acked); i++ {
+		if acked[i] {
+			t.Errorf("entry %d is set, but only 102 is pending inside the window", i)
+		}
+	}
+}
+
+// A packet pending beyond the window gives an all-zero bitfield rather than a
+// wider one.
+func TestSelectiveAckIgnoresPacketsPastTheWindow(t *testing.T) {
+	buf := newReceiveBuffer(2*1024*1024, 100)
+	far := 100 + 2 + uint16(selectiveAckWindow) + 1
+	if err := buf.Write([]byte("x"), far); err != nil {
+		t.Fatalf("write seq %d: %v", far, err)
+	}
+
+	ack := buf.SelectiveAck()
+	if ack == nil {
+		t.Fatal("a pending packet past the window should still produce a selective ack")
+	}
+	if got := ack.EncodedLen(); got != 4 {
+		t.Errorf("selective ack encoded to %d bytes, want 4", got)
+	}
+	for i, set := range ack.Acked() {
+		if set {
+			t.Errorf("entry %d is set for a packet outside the %d-entry window", i, selectiveAckWindow)
+		}
+	}
+}
